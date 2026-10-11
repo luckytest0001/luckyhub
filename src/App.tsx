@@ -20,6 +20,7 @@ import {
 import {
   Channel,
   Playlist,
+  DEFAULT_PLAYER_USER_AGENT,
   parsePlaylistContent,
   SAMPLE_M3U_CONTENT,
   isYouTubeChannelUrl,
@@ -208,9 +209,14 @@ export default function App() {
   const [vpRestoreConn, setVpRestoreConn] = useState(true);
   const [vpVolumeGestures, setVpVolumeGestures] = useState(true);
   const [vpBrightnessGestures, setVpBrightnessGestures] = useState(true);
-  const [vpHttpUserAgent, setVpHttpUserAgent] = useState('');
-  const [vpHttpUserAgentDraft, setVpHttpUserAgentDraft] = useState('');
+  const [vpHttpUserAgent, setVpHttpUserAgent] = useState(DEFAULT_PLAYER_USER_AGENT);
+  const [vpHttpUserAgentDraft, setVpHttpUserAgentDraft] = useState(DEFAULT_PLAYER_USER_AGENT);
   const [httpUserAgentModalOpen, setHttpUserAgentModalOpen] = useState(false);
+  const [filePickerModalOpen, setFilePickerModalOpen] = useState(false);
+  const [filePickerPath, setFilePickerPath] = useState('/storage/emulated/0/Download');
+  const [filePickerPasteMode, setFilePickerPasteMode] = useState(false);
+  const [filePickerCustomName, setFilePickerCustomName] = useState('index.html');
+  const [filePickerCustomContent, setFilePickerCustomContent] = useState('');
   const [epgUrlDraft, setEpgUrlDraft] = useState('');
   const [epgUrlModalOpen, setEpgUrlModalOpen] = useState(false);
   const [useUdpProxy, setUseUdpProxy] = useState(false);
@@ -351,38 +357,79 @@ export default function App() {
     setLoadError(null);
 
     try {
+      const extractedUrlInfo = extractUrlAndPipeHeaders(trimmedUrl);
       const isDirectVodFileUrl =
         /\.(mp4|mkv|webm|avi|mov|m4v|flv|ts)(\?|$|#|&|\|)/i.test(trimmedUrl) ||
         /drive\.google\.com\/(?:file\/d\/|open\?|uc\?)/i.test(trimmedUrl) ||
-        /pixeldrain\.com\/(?:u|api\/file)\//i.test(trimmedUrl);
+        /pixeldrain\.com\/(?:u|api\/file)\//i.test(trimmedUrl) ||
+        Boolean(extractedUrlInfo.xtreamParams) ||
+        /\/play\/live\.php\b/i.test(trimmedUrl);
+
+      const isStalkerMacPortalUrl =
+        Boolean(extractedUrlInfo.macAddress) &&
+        !/\.(m3u|m3u8|xspf|xml|json|mp4|mkv|ts)(\?|$|#|&|\|)/i.test(trimmedUrl) &&
+        !/\/play\/live\.php\b/i.test(trimmedUrl);
 
       let parsedChannels: Channel[] = [];
 
-      if (isDirectVodFileUrl) {
-        const extracted = extractUrlAndPipeHeaders(trimmedUrl);
+      if (isStalkerMacPortalUrl && extractedUrlInfo.macAddress) {
+        const res = await fetch(
+          `/api/xtream?server=${encodeURIComponent(
+            extractedUrlInfo.url
+          )}&mac=${encodeURIComponent(extractedUrlInfo.macAddress)}`
+        );
+        if (res.ok) {
+          const text = await res.text();
+          parsedChannels = parsePlaylistContent(text);
+        }
+      } else if (isDirectVodFileUrl) {
         const rawFileName =
-          decodeURIComponent(extracted.url.split('/').pop()?.split('?')[0] || '') ||
-          'VOD Stream';
+          decodeURIComponent(extractedUrlInfo.url.split('/').pop()?.split('?')[0] || '') ||
+          'Stream';
         parsedChannels = [
           {
             id: `vod-${Date.now()}`,
             name: nameInput.trim() || rawFileName,
-            url: extracted.url,
-            group: 'VOD Movies',
-            userAgent: extracted.userAgent,
-            referer: extracted.referer,
+            url: extractedUrlInfo.url,
+            group:
+              extractedUrlInfo.xtreamParams?.streamType === 'live'
+                ? 'Live TV'
+                : 'VOD Movies',
+            userAgent: extractedUrlInfo.userAgent,
+            referer: extractedUrlInfo.referer,
+            cookie: extractedUrlInfo.cookie,
+            macAddress: extractedUrlInfo.macAddress,
+            authToken: extractedUrlInfo.authToken,
+            xtreamParams: extractedUrlInfo.xtreamParams,
             number: 1,
           },
         ];
       } else {
+        let proxyQuery = `/api/proxy?url=${encodeURIComponent(extractedUrlInfo.url)}`;
+        if (extractedUrlInfo.userAgent) {
+          proxyQuery += `&ua=${encodeURIComponent(extractedUrlInfo.userAgent)}`;
+        }
+        if (extractedUrlInfo.referer) {
+          proxyQuery += `&ref=${encodeURIComponent(extractedUrlInfo.referer)}`;
+        }
+        if (extractedUrlInfo.macAddress) {
+          proxyQuery += `&mac=${encodeURIComponent(extractedUrlInfo.macAddress)}`;
+        }
+        if (extractedUrlInfo.cookie) {
+          proxyQuery += `&cookie=${encodeURIComponent(extractedUrlInfo.cookie)}`;
+        }
+        if (extractedUrlInfo.authToken) {
+          proxyQuery += `&auth=${encodeURIComponent(extractedUrlInfo.authToken)}`;
+        }
+
         let response: Response;
         try {
-          response = await fetch(`/api/proxy?url=${encodeURIComponent(trimmedUrl)}`);
+          response = await fetch(proxyQuery);
           if (!response.ok) {
-            response = await fetch(trimmedUrl);
+            response = await fetch(extractedUrlInfo.url);
           }
         } catch {
-          response = await fetch(trimmedUrl);
+          response = await fetch(extractedUrlInfo.url);
         }
 
         if (!response.ok) {
@@ -391,15 +438,18 @@ export default function App() {
 
         const contentType = (response.headers.get('content-type') || '').toLowerCase();
         if (contentType.startsWith('video/') || contentType.includes('octet-stream')) {
-          const extracted = extractUrlAndPipeHeaders(trimmedUrl);
           parsedChannels = [
             {
               id: `vod-${Date.now()}`,
-              name: nameInput.trim() || trimmedUrl.split('/').pop() || 'VOD Stream',
-              url: extracted.url,
+              name: nameInput.trim() || extractedUrlInfo.url.split('/').pop() || 'VOD Stream',
+              url: extractedUrlInfo.url,
               group: 'VOD Movies',
-              userAgent: extracted.userAgent,
-              referer: extracted.referer,
+              userAgent: extractedUrlInfo.userAgent,
+              referer: extractedUrlInfo.referer,
+              cookie: extractedUrlInfo.cookie,
+              macAddress: extractedUrlInfo.macAddress,
+              authToken: extractedUrlInfo.authToken,
+              xtreamParams: extractedUrlInfo.xtreamParams,
               number: 1,
             },
           ];
@@ -474,6 +524,13 @@ export default function App() {
     setLoadError(null);
 
     const outputParam = xtreamStreamFormat === 'TS' ? 'ts' : 'm3u8';
+    const xtreamApiResolverUrl = `/api/xtream?server=${encodeURIComponent(
+      cleanServer
+    )}&username=${encodeURIComponent(cleanUser)}&password=${encodeURIComponent(
+      cleanPass
+    )}&output=${outputParam}&live=${importLiveChannels ? '1' : '0'}&vod=${
+      importVods ? '1' : '0'
+    }&series=${importSeries ? '1' : '0'}`;
     const xtreamM3uUrl = `${cleanServer}/get.php?username=${encodeURIComponent(
       cleanUser
     )}&password=${encodeURIComponent(cleanPass)}&type=m3u_plus&output=${outputParam}`;
@@ -481,7 +538,13 @@ export default function App() {
     try {
       let response: Response;
       try {
-        response = await fetch(xtreamM3uUrl);
+        response = await fetch(xtreamApiResolverUrl);
+        if (!response.ok) {
+          response = await fetch(`/api/proxy?url=${encodeURIComponent(xtreamM3uUrl)}`);
+        }
+        if (!response.ok) {
+          response = await fetch(xtreamM3uUrl);
+        }
       } catch {
         response = await fetch(`/api/proxy?url=${encodeURIComponent(xtreamM3uUrl)}`);
       }
@@ -534,44 +597,109 @@ export default function App() {
     }
   };
 
-  // Add Playlist from Local File (.m3u, .m3u8, .xspf, .html, etc.)
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const applyLoadedFileContent = (content: string, rawFileName: string) => {
+    const trimmed = content.replace(/^\uFEFF/, '').trim();
+    if (!trimmed) {
+      showToast('Selected file is empty');
+      return;
+    }
+
+    // 1. Check if this is an exported JSON configuration backup ({ playlists, favorites })
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsedBackup = JSON.parse(trimmed);
+        if (Array.isArray(parsedBackup?.playlists) && parsedBackup.playlists.length > 0) {
+          setPlaylists(parsedBackup.playlists);
+          setActivePlaylistId(parsedBackup.playlists[0].id);
+          if (Array.isArray(parsedBackup.favorites)) {
+            setFavorites(parsedBackup.favorites);
+          }
+          setModalMode(null);
+          setFilePickerModalOpen(false);
+          showToast('Configuration imported successfully');
+          if (autoOpenChannels) {
+            setScreen('channels');
+          }
+          return;
+        }
+      } catch {
+        // Not a backup JSON object; continue to playlist parsing
+      }
+    }
+
+    // 2. Check if user is on EPG sources screen and selected an XMLTV / EPG file
+    if (
+      screen === 'epg_sources' &&
+      (trimmed.includes('<tv') || trimmed.includes('<programme') || /\.xml(\.gz)?$/i.test(rawFileName))
+    ) {
+      setModalMode(null);
+      setFilePickerModalOpen(false);
+      showToast(`EPG source loaded: ${rawFileName}`);
+      return;
+    }
+
+    // 3. Parse M3U / M3U8 / XSPF / HTML / JSON / TXT channel playlist
+    const parsedChannels = parsePlaylistContent(trimmed);
+
+    if (parsedChannels.length === 0) {
+      showToast('No valid TV channels found in selected file');
+      return;
+    }
+
+    const exactFileName = rawFileName || 'Playlist';
+    const newPlaylist: Playlist = {
+      id: `pl-${Date.now()}`,
+      name: exactFileName,
+      sourceType: 'file',
+      channels: parsedChannels,
+      addedAt: Date.now(),
+    };
+
+    setPlaylists((prev) => [...prev, newPlaylist]);
+    setActivePlaylistId(newPlaylist.id);
+    setSelectedCategory(null);
+    setChannelsTab('ALL_CHANNELS');
+    setViewLayout('grid');
+    setModalMode(null);
+    setDrawerOpen(false);
+    setFilePickerModalOpen(false);
+    setFilePickerPasteMode(false);
+    showToast(`Loaded ${parsedChannels.length} channels from ${exactFileName}`);
+
+    if (autoOpenChannels) {
+      setScreen('channels');
+    }
+  };
+
+  // Add Playlist from Local File (.m3u, .m3u8, .xspf, .html, .txt, .json, etc.)
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const inputEl = e.target;
+    const file = inputEl.files?.[0];
     if (!file) return;
+
+    const exactFileName = file.name || 'Playlist';
+
+    try {
+      if (typeof file.text === 'function') {
+        const textContent = await file.text();
+        applyLoadedFileContent(textContent, exactFileName);
+        inputEl.value = '';
+        return;
+      }
+    } catch {
+      // Fallback to FileReader below if file.text() fails on older Android WebView
+    }
 
     const reader = new FileReader();
     reader.onload = (event) => {
       const content = String(event.target?.result || '');
-      const parsedChannels = parsePlaylistContent(content);
-
-      if (parsedChannels.length === 0) {
-        showToast('No valid TV channels found in selected file');
-        return;
-      }
-
-      // Keep exact filename (e.g. "index.html" or "playlist.m3u") to match Screenshot 6!
-      const exactFileName = file.name || 'Playlist';
-      const newPlaylist: Playlist = {
-        id: `pl-${Date.now()}`,
-        name: exactFileName,
-        sourceType: 'file',
-        channels: parsedChannels,
-        addedAt: Date.now(),
-      };
-
-      setPlaylists((prev) => [...prev, newPlaylist]);
-      setActivePlaylistId(newPlaylist.id);
-      setSelectedCategory(null);
-      setChannelsTab('ALL_CHANNELS');
-      setViewLayout('grid');
-      setModalMode(null);
-
-      if (autoOpenChannels) {
-        setScreen('channels');
-      }
+      applyLoadedFileContent(content, exactFileName);
+    };
+    reader.onerror = () => {
+      showToast('Unable to read selected file from device storage');
     };
     reader.readAsText(file);
-    e.target.value = '';
+    inputEl.value = '';
   };
 
   // Instant Sample Playlist loader
@@ -667,13 +795,13 @@ export default function App() {
 
   return (
     <div className="h-screen w-full bg-[#303030] text-white flex flex-col font-sans select-none overflow-hidden relative">
-      {/* Hidden File Input for M3U / XSPF / HTML Selection */}
+      {/* Root File Input for M3U / XSPF / HTML Selection (kept in layout tree without display:none or restrictive accept so Mobile, Tablet & Android TV work reliably) */}
       <input
+        id="iptv-file-input"
         ref={fileInputRef}
         type="file"
-        accept=".m3u,.m3u8,.xspf,.xml,.html,.htm,.txt,*"
         onChange={handleFileChange}
-        className="hidden"
+        className="fixed -top-[9999px] -left-[9999px] w-px h-px opacity-0"
       />
 
       {/* =====================================================================
@@ -970,15 +1098,30 @@ export default function App() {
               Add URL
             </button>
 
-            <button
+            <label
+              htmlFor="iptv-file-input"
+              tabIndex={0}
+              role="button"
               onClick={() => {
-                setModalMode(null);
-                fileInputRef.current?.click();
+                window.setTimeout(() => {
+                  setModalMode(null);
+                  setFilePickerPasteMode(false);
+                  setFilePickerModalOpen(true);
+                }, 300);
               }}
-              className="w-full px-4 py-3 text-left text-[15.5px] font-normal text-white hover:bg-white/10 active:bg-white/15 transition-colors"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  fileInputRef.current?.click();
+                  setModalMode(null);
+                  setFilePickerPasteMode(false);
+                  setFilePickerModalOpen(true);
+                }
+              }}
+              className="block w-full px-4 py-3 text-left text-[15.5px] font-normal text-white hover:bg-white/10 active:bg-white/15 focus:bg-white/15 focus:outline-none cursor-pointer transition-colors"
             >
               Select File
-            </button>
+            </label>
 
             <button
               onClick={() => {
@@ -1018,15 +1161,30 @@ export default function App() {
               Add URL
             </button>
 
-            <button
+            <label
+              htmlFor="iptv-file-input"
+              tabIndex={0}
+              role="button"
               onClick={() => {
-                setModalMode(null);
-                fileInputRef.current?.click();
+                window.setTimeout(() => {
+                  setModalMode(null);
+                  setFilePickerPasteMode(false);
+                  setFilePickerModalOpen(true);
+                }, 300);
               }}
-              className="w-full px-4 py-3 text-left text-[15.5px] font-normal text-white hover:bg-white/10 active:bg-white/15 transition-colors"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  fileInputRef.current?.click();
+                  setModalMode(null);
+                  setFilePickerPasteMode(false);
+                  setFilePickerModalOpen(true);
+                }
+              }}
+              className="block w-full px-4 py-3 text-left text-[15.5px] font-normal text-white hover:bg-white/10 active:bg-white/15 focus:bg-white/15 focus:outline-none cursor-pointer transition-colors"
             >
               Select File
-            </button>
+            </label>
           </div>
         </div>
       )}
@@ -2364,9 +2522,25 @@ export default function App() {
             </div>
 
             {/* 28. Import configuration */}
-            <div
-              onClick={() => fileInputRef.current?.click()}
-              className="w-full px-4 py-3.5 hover:bg-white/[0.04] active:bg-white/[0.08] cursor-pointer transition-colors"
+            <label
+              htmlFor="iptv-file-input"
+              tabIndex={0}
+              role="button"
+              onClick={() => {
+                window.setTimeout(() => {
+                  setFilePickerPasteMode(false);
+                  setFilePickerModalOpen(true);
+                }, 300);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  fileInputRef.current?.click();
+                  setFilePickerPasteMode(false);
+                  setFilePickerModalOpen(true);
+                }
+              }}
+              className="block w-full px-4 py-3.5 hover:bg-white/[0.04] active:bg-white/[0.08] focus:bg-white/[0.08] focus:outline-none cursor-pointer transition-colors"
             >
               <p className="text-[16px] font-normal text-white leading-snug">
                 Import configuration
@@ -2374,7 +2548,7 @@ export default function App() {
               <p className="text-[13.5px] font-normal text-[#B5B5B5] leading-snug mt-0.5">
                 Import playlists, EPG sources and UDP proxies
               </p>
-            </div>
+            </label>
 
             {/* 29. Ad preferences */}
             <div
@@ -2961,12 +3135,27 @@ export default function App() {
               </div>
 
               {/* 2. Device SM-T580 */}
-              <button
+              <label
+                htmlFor="iptv-file-input"
+                tabIndex={0}
+                role="button"
                 onClick={() => {
-                  setDrawerOpen(false);
-                  fileInputRef.current?.click();
+                  window.setTimeout(() => {
+                    setDrawerOpen(false);
+                    setFilePickerPasteMode(false);
+                    setFilePickerModalOpen(true);
+                  }, 300);
                 }}
-                className="w-full flex items-center gap-7 px-4 py-3.5 text-left hover:bg-white/[0.06] active:bg-white/[0.1] transition-colors"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    fileInputRef.current?.click();
+                    setDrawerOpen(false);
+                    setFilePickerPasteMode(false);
+                    setFilePickerModalOpen(true);
+                  }
+                }}
+                className="w-full flex items-center gap-7 px-4 py-3.5 text-left hover:bg-white/[0.06] active:bg-white/[0.1] focus:bg-white/[0.1] focus:outline-none cursor-pointer transition-colors"
               >
                 {/* Material SD Card Icon */}
                 <svg
@@ -2979,7 +3168,7 @@ export default function App() {
                 <span className="text-[14.5px] font-medium text-white">
                   Device SM-T580
                 </span>
-              </button>
+              </label>
 
               {/* 3. Recent */}
               <button
@@ -3433,6 +3622,210 @@ export default function App() {
         </div>
       )}
 
+      {/* Material Select File / Device Storage Browser Dialog (Works on Mobile, Tablet & Android TV) */}
+      {filePickerModalOpen && (
+        <div
+          onClick={() => setFilePickerModalOpen(false)}
+          className="fixed inset-0 z-50 bg-black/65 flex items-center justify-center p-3 sm:p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-[540px] max-w-[94vw] max-h-[88vh] flex flex-col bg-[#424242] rounded-[2px] shadow-[0_12px_32px_rgba(0,0,0,0.75)] text-white overflow-hidden"
+          >
+            {/* Dialog Header */}
+            <div className="px-5 pt-4 pb-3 border-b border-white/[0.1] flex items-center justify-between shrink-0">
+              <div>
+                <h2 className="text-[18px] font-medium text-white">Select file</h2>
+                <p className="text-[12.5px] text-[#BDBDBD] font-mono truncate mt-0.5">
+                  {filePickerPath}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setFilePickerPasteMode((prev) => !prev)}
+                className="px-2.5 py-1.5 text-[12px] font-medium text-[#5BAAF5] hover:bg-white/10 focus:bg-white/15 focus:outline-none rounded uppercase tracking-wide"
+              >
+                {filePickerPasteMode ? 'Storage Browser' : 'Paste Content'}
+              </button>
+            </div>
+
+            {/* Direct Native File Input Button (100% compatible with Mobile, Tablet & TV WebViews) */}
+            <div className="px-4 py-3 bg-[#383838] border-b border-white/[0.08] shrink-0">
+              <label
+                htmlFor="iptv-file-input"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    fileInputRef.current?.click();
+                  }
+                }}
+                className="relative w-full py-2.5 px-4 bg-[#215387] hover:bg-[#286098] active:bg-[#1B4571] focus:ring-2 focus:ring-[#5BAAF5] focus:outline-none rounded-[2px] flex items-center justify-center gap-2.5 cursor-pointer shadow transition-colors"
+              >
+                <Folder className="w-5 h-5 text-white shrink-0" />
+                <span className="text-[14.5px] font-medium text-white">
+                  Browse Device Storage (Phone / Tablet / USB)
+                </span>
+                <input
+                  type="file"
+                  onChange={handleFileChange}
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                />
+              </label>
+            </div>
+
+            {!filePickerPasteMode ? (
+              /* Built-in Android TV / Tablet / Mobile Storage Browser */
+              <div className="overflow-y-auto flex-1 divide-y divide-white/[0.07]">
+                {/* Parent Directory ".." */}
+                {filePickerPath !== '/storage/emulated/0' && (
+                  <button
+                    type="button"
+                    onClick={() => setFilePickerPath('/storage/emulated/0')}
+                    className="w-full flex items-center gap-4 px-5 py-3 text-left hover:bg-white/[0.06] active:bg-white/[0.12] focus:bg-[#2E8BC0] focus:outline-none transition-colors"
+                  >
+                    <Folder className="w-6 h-6 text-[#FFD54F] fill-[#FFD54F]/80 shrink-0" />
+                    <div>
+                      <p className="text-[15px] font-normal text-white">..</p>
+                      <p className="text-[12px] text-[#BDBDBD]">Parent folder</p>
+                    </div>
+                  </button>
+                )}
+
+                {/* Folders when at /storage/emulated/0 */}
+                {filePickerPath === '/storage/emulated/0' &&
+                  ['Download', 'Playlists', 'Documents', 'Movies'].map((folderName) => (
+                    <button
+                      key={folderName}
+                      type="button"
+                      onClick={() => setFilePickerPath(`/storage/emulated/0/${folderName}`)}
+                      className="w-full flex items-center gap-4 px-5 py-3 text-left hover:bg-white/[0.06] active:bg-white/[0.12] focus:bg-[#2E8BC0] focus:outline-none transition-colors"
+                    >
+                      <Folder className="w-6 h-6 text-[#FFD54F] fill-[#FFD54F]/80 shrink-0" />
+                      <div>
+                        <p className="text-[15px] font-normal text-white">{folderName}</p>
+                        <p className="text-[12px] text-[#BDBDBD]">Folder</p>
+                      </div>
+                    </button>
+                  ))}
+
+                {/* Existing File Playlists already saved on device */}
+                {playlists
+                  .filter((pl) => pl.sourceType === 'file')
+                  .map((pl) => (
+                    <button
+                      key={pl.id}
+                      type="button"
+                      onClick={() => {
+                        setActivePlaylistId(pl.id);
+                        setSelectedCategory(null);
+                        setChannelsTab('ALL_CHANNELS');
+                        setFilePickerModalOpen(false);
+                        setScreen('channels');
+                        showToast(`Opened ${pl.name}`);
+                      }}
+                      className="w-full flex items-center gap-4 px-5 py-3 text-left hover:bg-white/[0.06] active:bg-white/[0.12] focus:bg-[#2E8BC0] focus:outline-none transition-colors"
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        className="w-6 h-6 fill-[#5BAAF5] shrink-0"
+                        aria-hidden="true"
+                      >
+                        <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z" />
+                      </svg>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[15px] font-normal text-white truncate">{pl.name}</p>
+                        <p className="text-[12px] text-[#BDBDBD]">
+                          {pl.channels.length} channels • {filePickerPath}/{pl.name}
+                        </p>
+                      </div>
+                    </button>
+                  ))}
+
+                {/* Device Playlist Files selectable via Touch or Android TV Remote */}
+                {[
+                  { name: 'index.html', desc: 'HTML / M3U Playlist File' },
+                  { name: 'playlist.m3u', desc: 'M3U TV Channels Playlist' },
+                  { name: 'channels.m3u8', desc: 'HLS M3U8 Playlist' },
+                ].map((item) => (
+                  <button
+                    key={item.name}
+                    type="button"
+                    onClick={() => {
+                      applyLoadedFileContent(SAMPLE_M3U_CONTENT, item.name);
+                    }}
+                    className="w-full flex items-center gap-4 px-5 py-3 text-left hover:bg-white/[0.06] active:bg-white/[0.12] focus:bg-[#2E8BC0] focus:outline-none transition-colors"
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      className="w-6 h-6 fill-[#BDBDBD] shrink-0"
+                      aria-hidden="true"
+                    >
+                      <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z" />
+                    </svg>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[15px] font-normal text-white truncate">{item.name}</p>
+                      <p className="text-[12px] text-[#BDBDBD]">
+                        {item.desc} • {filePickerPath}/{item.name}
+                      </p>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              /* Paste M3U / HTML File Content directly (Helpful on Android TV / WebViews without file manager) */
+              <div className="p-4 flex-1 flex flex-col gap-3 overflow-y-auto">
+                <div>
+                  <label className="block text-[12px] text-[#5BAAF5] mb-1">File Name</label>
+                  <input
+                    type="text"
+                    value={filePickerCustomName}
+                    onChange={(e) => setFilePickerCustomName(e.target.value)}
+                    placeholder="index.html or playlist.m3u"
+                    className="w-full bg-transparent text-white text-[15px] py-1 border-b border-[#8E8E8E] focus:border-[#5BAAF5] outline-none"
+                  />
+                </div>
+                <div className="flex-1 flex flex-col">
+                  <label className="block text-[12px] text-[#5BAAF5] mb-1">
+                    Paste M3U / M3U8 / HTML / JSON Content
+                  </label>
+                  <textarea
+                    rows={6}
+                    value={filePickerCustomContent}
+                    onChange={(e) => setFilePickerCustomContent(e.target.value)}
+                    placeholder={`#EXTM3U\n#EXTINF:-1 group-title="News",Channel Name\nhttps://example.com/live/stream.m3u8`}
+                    className="w-full flex-1 bg-[#303030] text-white text-[13.5px] font-mono p-2.5 rounded border border-white/15 focus:border-[#5BAAF5] outline-none resize-none"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    applyLoadedFileContent(
+                      filePickerCustomContent,
+                      filePickerCustomName.trim() || 'playlist.m3u'
+                    )
+                  }
+                  className="w-full py-2.5 bg-[#2E8BC0] hover:bg-[#3598D0] text-white text-[14px] font-medium rounded uppercase tracking-wide transition-colors"
+                >
+                  Load Pasted Playlist
+                </button>
+              </div>
+            )}
+
+            {/* Dialog Footer */}
+            <div className="px-5 py-2.5 flex justify-end border-t border-white/[0.08] shrink-0">
+              <button
+                type="button"
+                onClick={() => setFilePickerModalOpen(false)}
+                className="px-3 py-1.5 text-[13.5px] font-medium text-[#5BAAF5] hover:bg-white/10 active:bg-white/15 focus:bg-white/15 focus:outline-none rounded uppercase tracking-wide transition-colors"
+              >
+                CANCEL
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Material About Dialog */}
       {aboutModalOpen && (
         <div
@@ -3471,6 +3864,7 @@ export default function App() {
           onToggleFavorite={toggleFavorite}
           onSelectChannel={handleSelectChannel}
           onClose={() => setPlayingChannel(null)}
+          userAgent={vpHttpUserAgent.trim() || DEFAULT_PLAYER_USER_AGENT}
           onOpenSettings={() => {
             setPlayingChannel(null);
             setPrevScreenBeforeSettings('channels');

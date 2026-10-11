@@ -1,3 +1,16 @@
+export const DEFAULT_PLAYER_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
+
+export interface XtreamStreamParams {
+  server: string;
+  username: string;
+  password: string;
+  streamId: string;
+  streamType: 'live' | 'movie' | 'series';
+  extension?: string;
+  queryParams?: string;
+}
+
 export interface Channel {
   id: string;
   name: string;
@@ -7,6 +20,10 @@ export interface Channel {
   tvgId?: string;
   userAgent?: string;
   referer?: string;
+  cookie?: string;
+  macAddress?: string;
+  authToken?: string;
+  xtreamParams?: XtreamStreamParams;
   number: number;
 }
 
@@ -61,8 +78,265 @@ export function openExternalChannelLink(rawUrl: string): void {
   document.body.removeChild(anchor);
 }
 
+function safeDecodeURIComponent(val: string): string {
+  try {
+    return decodeURIComponent(val);
+  } catch {
+    return val;
+  }
+}
+
 /**
- * Normalizes cloud VOD sharing links (Google Drive, Pixeldrain, Dropbox) into direct media stream URLs
+ * Normalizes a raw MAC address string (e.g. "00:1a:79:12:34:56", "00-1A-79-12-34-56",
+ * "00%3A1A%3A79%3A12%3A34%3A56", or "001A79123456") into uppercase colon-separated format.
+ */
+export function normalizeMacAddress(rawMac?: string): string | undefined {
+  if (!rawMac) return undefined;
+  const decoded = safeDecodeURIComponent(safeDecodeURIComponent(rawMac))
+    .trim()
+    .replace(/^["']+|["']+$/g, '');
+  const colonOrDashMatch = decoded.match(
+    /\b([0-9a-fA-F]{2})(?:[:-]([0-9a-fA-F]{2})){5}\b/
+  );
+  if (colonOrDashMatch) {
+    return colonOrDashMatch[0].replace(/-/g, ':').toUpperCase();
+  }
+  const underscoreMatch = decoded.match(
+    /\b([0-9a-fA-F]{2})(?:_([0-9a-fA-F]{2})){5}\b/
+  );
+  if (underscoreMatch) {
+    return underscoreMatch[0].replace(/_/g, ':').toUpperCase();
+  }
+  const compactHexMatch = decoded.match(/^[0-9a-fA-F]{12}$/);
+  if (compactHexMatch) {
+    return (
+      decoded
+        .toUpperCase()
+        .match(/.{1,2}/g)
+        ?.join(':') || undefined
+    );
+  }
+  return undefined;
+}
+
+/**
+ * Builds a standard Stalker / MAG STB cookie header for a given MAC address,
+ * merging with any existing cookies without duplicating keys.
+ */
+export function buildMacCookieHeader(macAddress?: string, existingCookie?: string): string | undefined {
+  const normMac = normalizeMacAddress(macAddress);
+  if (!normMac && !existingCookie) return undefined;
+  const parts: string[] = [];
+  if (existingCookie) {
+    existingCookie.split(';').forEach((c) => {
+      const trimmed = c.trim();
+      if (trimmed) parts.push(trimmed);
+    });
+  }
+  if (normMac) {
+    const hasMacInCookie = parts.some((p) => /^mac\s*=/i.test(p));
+    if (!hasMacInCookie) {
+      parts.unshift(`mac=${normMac}`);
+    }
+    if (!parts.some((p) => /^stb_lang\s*=/i.test(p))) {
+      parts.push('stb_lang=en');
+    }
+    if (!parts.some((p) => /^timezone\s*=/i.test(p))) {
+      parts.push('timezone=GMT');
+    }
+  }
+  return parts.length > 0 ? parts.join('; ') : undefined;
+}
+
+const RESERVED_NON_XTREAM_SEGMENTS = new Set([
+  'live',
+  'movie',
+  'series',
+  'play',
+  'stalker_portal',
+  'c',
+  'server',
+  'hls',
+  'stream',
+  'streams',
+  'api',
+  'download',
+  'file',
+  'details',
+  'uc',
+  'open',
+  'vod',
+  'tv',
+  'channels',
+  'ch',
+  'portal.php',
+  'load.php',
+  'get.php',
+  'player_api.php',
+]);
+
+/**
+ * Parses Xtream Codes API stream URLs and MAC / Stalker Portal authentication parameters
+ * from a stream URL.
+ */
+export function parseXtreamAndMacParams(rawUrl: string): {
+  xtreamParams?: XtreamStreamParams;
+  macAddress?: string;
+  authToken?: string;
+} {
+  let u = rawUrl.trim();
+  // Strip Stalker portal command prefixes like "ffmpeg http://..." or "ffrt3 http://..."
+  u = u.replace(/^(?:ffmpeg|ffrt\d*|solution)\s+(?=(?:https?|rtmp|rtsp|udp|mms):\/\/)/i, '').trim();
+
+  let xtreamParams: XtreamStreamParams | undefined;
+  let macAddress: string | undefined;
+  let authToken: string | undefined;
+
+  // 1. Check for inline MAC address in URL query/path/params
+  const macQueryMatch = u.match(
+    /[?&;#|](?:mac|deviceMac|stb_mac|mac_address|hw_id)=([^&#|;\s]+)/i
+  );
+  if (macQueryMatch?.[1]) {
+    macAddress = normalizeMacAddress(macQueryMatch[1]);
+  }
+  if (!macAddress) {
+    const embeddedMacMatch = safeDecodeURIComponent(u).match(
+      /\b(00:1[aA]:79:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})\b/
+    );
+    if (embeddedMacMatch?.[1]) {
+      macAddress = embeddedMacMatch[1].toUpperCase();
+    }
+  }
+
+  // 2. Check for token / play_token / auth parameters in query string
+  const tokenMatch = u.match(
+    /[?&](?:play_token|token|access_token|auth_token|auth|jwt|wmsAuthSign)=([^&#|\s]+)/i
+  );
+  if (tokenMatch?.[1]) {
+    authToken = safeDecodeURIComponent(tokenMatch[1]).trim();
+  }
+
+  // 3. Parse standard Xtream Codes API path:
+  //    http(s)://host:port/(live|movie|series)/username/password/streamId(.ext)
+  const explicitXtreamMatch = u.match(
+    /^(https?:\/\/[^/?#]+)\/(live|movie|series)\/([^/?#]+)\/([^/?#]+)\/([^/?#.]+)(?:\.([a-zA-Z0-9]{2,5}))?(?:\?([^#]*))?$/i
+  );
+  if (explicitXtreamMatch) {
+    const server = explicitXtreamMatch[1];
+    const streamType = explicitXtreamMatch[2].toLowerCase() as 'live' | 'movie' | 'series';
+    const username = safeDecodeURIComponent(explicitXtreamMatch[3]);
+    const password = safeDecodeURIComponent(explicitXtreamMatch[4]);
+    const streamId = explicitXtreamMatch[5];
+    const extension = explicitXtreamMatch[6]?.toLowerCase();
+    const queryParams = explicitXtreamMatch[7];
+    xtreamParams = {
+      server,
+      username,
+      password,
+      streamId,
+      streamType,
+      extension,
+      queryParams,
+    };
+    return { xtreamParams, macAddress, authToken };
+  }
+
+  // 4. Parse short Xtream Codes Live path:
+  //    http(s)://host:port/username/password/streamId(.ext)
+  const shortXtreamMatch = u.match(
+    /^(https?:\/\/[^/?#]+)\/([^/?#]+)\/([^/?#]+)\/(\d+)(?:\.([a-zA-Z0-9]{2,5}))?(?:\?([^#]*))?$/i
+  );
+  if (shortXtreamMatch) {
+    const seg1 = shortXtreamMatch[2].toLowerCase();
+    const seg2 = shortXtreamMatch[3].toLowerCase();
+    if (!RESERVED_NON_XTREAM_SEGMENTS.has(seg1) && !RESERVED_NON_XTREAM_SEGMENTS.has(seg2)) {
+      xtreamParams = {
+        server: shortXtreamMatch[1],
+        username: safeDecodeURIComponent(shortXtreamMatch[2]),
+        password: safeDecodeURIComponent(shortXtreamMatch[3]),
+        streamId: shortXtreamMatch[4],
+        streamType: 'live',
+        extension: shortXtreamMatch[5]?.toLowerCase(),
+        queryParams: shortXtreamMatch[6],
+      };
+      return { xtreamParams, macAddress, authToken };
+    }
+  }
+
+  // 5. Parse query-based Xtream Codes URL:
+  //    http(s)://host:port/live.php?username=...&password=...&stream=123&extension=ts
+  try {
+    const parsed = new URL(u);
+    const qUser =
+      parsed.searchParams.get('username') ||
+      parsed.searchParams.get('user') ||
+      parsed.searchParams.get('login');
+    const qPass =
+      parsed.searchParams.get('password') ||
+      parsed.searchParams.get('pass');
+    const qStream =
+      parsed.searchParams.get('stream') ||
+      parsed.searchParams.get('stream_id') ||
+      parsed.searchParams.get('id') ||
+      parsed.searchParams.get('ch_id');
+    const qExt =
+      parsed.searchParams.get('extension') ||
+      parsed.searchParams.get('output') ||
+      parsed.searchParams.get('type');
+
+    if (qUser && qPass) {
+      const pathStreamMatch = parsed.pathname.match(/\/(\d+)(?:\.([a-zA-Z0-9]{2,5}))?$/);
+      const streamId = qStream || pathStreamMatch?.[1] || '';
+      if (streamId) {
+        const lowerPath = parsed.pathname.toLowerCase();
+        const streamType: 'live' | 'movie' | 'series' = lowerPath.includes('movie')
+          ? 'movie'
+          : lowerPath.includes('series')
+          ? 'series'
+          : 'live';
+        xtreamParams = {
+          server: parsed.origin,
+          username: qUser,
+          password: qPass,
+          streamId,
+          streamType,
+          extension: (qExt || pathStreamMatch?.[2] || undefined)?.toLowerCase(),
+          queryParams: parsed.search ? parsed.search.slice(1) : undefined,
+        };
+      }
+    }
+  } catch {
+    // ignore invalid URL
+  }
+
+  return { xtreamParams, macAddress, authToken };
+}
+
+/**
+ * Generates alternate Xtream Codes stream URLs (e.g. .m3u8 and .ts variants with /live/ prefix)
+ * so the player can seamlessly switch between HLS and MPEG-TS while preserving authentication.
+ */
+export function buildAuthenticatedXtreamAltUrls(channel: Channel): {
+  hlsUrl?: string;
+  tsUrl?: string;
+  rawLiveUrl?: string;
+} {
+  const xp = channel.xtreamParams || parseXtreamAndMacParams(channel.url).xtreamParams;
+  if (!xp || xp.streamType !== 'live') return {};
+  const base = xp.server.replace(/\/+$/, '');
+  const u = encodeURIComponent(xp.username);
+  const p = encodeURIComponent(xp.password);
+  const id = encodeURIComponent(xp.streamId);
+  const qs = xp.queryParams ? `?${xp.queryParams}` : '';
+  return {
+    hlsUrl: `${base}/live/${u}/${p}/${id}.m3u8${qs}`,
+    tsUrl: `${base}/live/${u}/${p}/${id}.ts${qs}`,
+    rawLiveUrl: `${base}/live/${u}/${p}/${id}${qs}`,
+  };
+}
+
+/**
+ * Normalizes cloud VOD sharing links (Google Drive, Pixeldrain, Dropbox), Stalker cmd prefixes,
  * and cleans HTML artifacts or unencoded spaces.
  */
 export function normalizeVodMediaUrl(rawUrl: string): string {
@@ -72,6 +346,9 @@ export function normalizeVodMediaUrl(rawUrl: string): string {
     .replace(/&#38;/g, '&')
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/g, "'");
+
+  // Strip Stalker/MAG portal command prefixes like "ffmpeg http://..." or "ffrt3 http://..."
+  u = u.replace(/^(?:ffmpeg|ffrt\d*|solution)\s+(?=(?:https?|rtmp|rtsp|udp|mms):\/\/)/i, '').trim();
 
   // Strip any HTML tags or quotes that might follow a URL in an HTML-wrapped M3U file
   u = u.split(/["'<>]/)[0].trim();
@@ -110,22 +387,18 @@ export function normalizeVodMediaUrl(rawUrl: string): string {
   return u.replace(/ /g, '%20');
 }
 
-function safeDecodeURIComponent(val: string): string {
-  try {
-    return decodeURIComponent(val);
-  } catch {
-    return val;
-  }
-}
-
 /**
- * Extracts pipe headers like `http://...|User-Agent=foo&Referer=bar` or `http://...|User-Agent=foo|Referer=bar`
- * and encodes raw spaces inside the URL path as %20 so VOD URLs with spaces play properly.
+ * Extracts pipe headers like `http://...|User-Agent=foo&Referer=bar&Cookie=mac=00:1A:79:...&Authorization=Bearer ...`
+ * as well as Xtream Codes API parameters and MAC address parameters.
  */
 export function extractUrlAndPipeHeaders(rawUrl: string): {
   url: string;
   userAgent?: string;
   referer?: string;
+  cookie?: string;
+  macAddress?: string;
+  authToken?: string;
+  xtreamParams?: XtreamStreamParams;
 } {
   const cleanedRaw = rawUrl
     .trim()
@@ -133,51 +406,100 @@ export function extractUrlAndPipeHeaders(rawUrl: string): {
     .replace(/&#38;/g, '&');
 
   const pipeIndex = cleanedRaw.indexOf('|');
-  if (pipeIndex === -1) {
-    return { url: normalizeVodMediaUrl(cleanedRaw) };
-  }
+  const basePart = pipeIndex === -1 ? cleanedRaw : cleanedRaw.slice(0, pipeIndex);
+  const base = normalizeVodMediaUrl(basePart);
+  const parsedUrlAuth = parseXtreamAndMacParams(base);
 
-  const base = normalizeVodMediaUrl(cleanedRaw.slice(0, pipeIndex));
-  const headerPart = cleanedRaw.slice(pipeIndex + 1).trim();
   let userAgent: string | undefined;
   let referer: string | undefined;
+  let cookie: string | undefined;
+  let macAddress: string | undefined = parsedUrlAuth.macAddress;
+  let authToken: string | undefined = parsedUrlAuth.authToken;
 
-  headerPart.split(/[&|]/).forEach((pair) => {
-    const eqIdx = pair.indexOf('=');
-    if (eqIdx !== -1) {
-      const key = pair.slice(0, eqIdx).trim().toLowerCase();
-      const rawVal = pair
-        .slice(eqIdx + 1)
-        .trim()
-        .replace(/^["']+|["']+$/g, '');
-      const val = safeDecodeURIComponent(rawVal);
-      if (key === 'user-agent' || key === 'useragent' || key === 'http-user-agent') {
-        userAgent = val;
-      } else if (
-        key === 'referer' ||
-        key === 'referrer' ||
-        key === 'origin' ||
-        key === 'http-referer' ||
-        key === 'http-referrer'
-      ) {
-        referer = val;
+  if (pipeIndex !== -1) {
+    const headerPart = cleanedRaw.slice(pipeIndex + 1).trim();
+    headerPart.split(/[&|]/).forEach((pair) => {
+      const eqIdx = pair.indexOf('=');
+      if (eqIdx !== -1) {
+        const key = pair.slice(0, eqIdx).trim().toLowerCase();
+        const rawVal = pair
+          .slice(eqIdx + 1)
+          .trim()
+          .replace(/^["']+|["']+$/g, '');
+        const val = safeDecodeURIComponent(rawVal);
+        if (key === 'user-agent' || key === 'useragent' || key === 'http-user-agent') {
+          userAgent = val;
+        } else if (
+          key === 'referer' ||
+          key === 'referrer' ||
+          key === 'origin' ||
+          key === 'http-referer' ||
+          key === 'http-referrer'
+        ) {
+          referer = val;
+        } else if (key === 'cookie' || key === 'cookies' || key === 'http-cookie') {
+          cookie = cookie ? `${cookie}; ${val}` : val;
+          const macInCookie = normalizeMacAddress(val);
+          if (macInCookie && !macAddress) {
+            macAddress = macInCookie;
+          }
+        } else if (
+          key === 'mac' ||
+          key === 'mac-address' ||
+          key === 'mac_address' ||
+          key === 'stb-mac' ||
+          key === 'stb_mac' ||
+          key === 'devicemac'
+        ) {
+          const norm = normalizeMacAddress(val);
+          if (norm) macAddress = norm;
+        } else if (
+          key === 'authorization' ||
+          key === 'auth' ||
+          key === 'token' ||
+          key === 'play_token' ||
+          key === 'bearer' ||
+          key === 'x-auth-token'
+        ) {
+          authToken = val;
+        }
       }
-    }
-  });
+    });
+  }
 
-  return { url: base, userAgent, referer };
+  const finalCookie = buildMacCookieHeader(macAddress, cookie);
+
+  return {
+    url: base,
+    userAgent,
+    referer,
+    cookie: finalCookie,
+    macAddress,
+    authToken,
+    xtreamParams: parsedUrlAuth.xtreamParams,
+  };
 }
 
 /**
- * Repairs and normalizes an existing Channel (e.g. loaded from localStorage).
+ * Repairs and normalizes an existing Channel (e.g. loaded from localStorage),
+ * ensuring Xtream Codes API parameters and MAC address auth parameters are extracted.
  */
 export function repairAndNormalizeChannel(ch: Channel): Channel {
   const extracted = extractUrlAndPipeHeaders(ch.url || '');
+  const resolvedMac =
+    normalizeMacAddress(ch.macAddress) ||
+    extracted.macAddress ||
+    normalizeMacAddress(ch.cookie);
+  const resolvedCookie = buildMacCookieHeader(resolvedMac, ch.cookie || extracted.cookie);
   return {
     ...ch,
     url: extracted.url,
     userAgent: ch.userAgent || extracted.userAgent,
     referer: ch.referer || extracted.referer,
+    cookie: resolvedCookie,
+    macAddress: resolvedMac,
+    authToken: ch.authToken || extracted.authToken,
+    xtreamParams: ch.xtreamParams || extracted.xtreamParams,
   };
 }
 
@@ -201,13 +523,26 @@ export function parseM3U(content: string): Channel[] {
   let currentTvgId = '';
   let currentUserAgent: string | undefined;
   let currentReferer: string | undefined;
+  let currentCookie: string | undefined;
+  let currentMacAddress: string | undefined;
+  let currentAuthToken: string | undefined;
 
   const pushChannelFromRawUrl = (rawLine: string) => {
     const firstQuoteOrTag = rawLine.split(/["'<>]/)[0].trim();
     if (!firstQuoteOrTag) return;
-    const { url, userAgent, referer } = extractUrlAndPipeHeaders(firstQuoteOrTag);
+    const {
+      url,
+      userAgent,
+      referer,
+      cookie,
+      macAddress,
+      authToken,
+      xtreamParams,
+    } = extractUrlAndPipeHeaders(firstQuoteOrTag);
     if (!url) return;
     const number = channels.length + 1;
+    const finalMac = macAddress || currentMacAddress;
+    const finalCookie = buildMacCookieHeader(finalMac, cookie || currentCookie);
     channels.push({
       id: `ch-${number}-${Math.random().toString(36).slice(2, 7)}`,
       name: currentName || `Channel ${number}`,
@@ -217,6 +552,10 @@ export function parseM3U(content: string): Channel[] {
       tvgId: currentTvgId || undefined,
       userAgent: userAgent || currentUserAgent,
       referer: referer || currentReferer,
+      cookie: finalCookie,
+      macAddress: finalMac,
+      authToken: authToken || currentAuthToken,
+      xtreamParams,
       number,
     });
     currentName = '';
@@ -225,6 +564,9 @@ export function parseM3U(content: string): Channel[] {
     currentTvgId = '';
     currentUserAgent = undefined;
     currentReferer = undefined;
+    currentCookie = undefined;
+    currentMacAddress = undefined;
+    currentAuthToken = undefined;
   };
 
   for (let i = 0; i < lines.length; i++) {
@@ -240,12 +582,18 @@ export function parseM3U(content: string): Channel[] {
       const tvgNameMatch = extInfLine.match(/tvg-name=["']([^"']*)["']/i);
       const uaAttrMatch = extInfLine.match(/(?:user-agent|http-user-agent)=["']([^"']*)["']/i);
       const refAttrMatch = extInfLine.match(/(?:referer|referrer|http-referer|http-referrer)=["']([^"']*)["']/i);
+      const macAttrMatch = extInfLine.match(/(?:tvg-mac|mac|mac-address|stb-mac)=["']([^"']*)["']/i);
+      const cookieAttrMatch = extInfLine.match(/(?:cookie|http-cookie)=["']([^"']*)["']/i);
+      const tokenAttrMatch = extInfLine.match(/(?:token|play-token|play_token|authorization)=["']([^"']*)["']/i);
 
       currentLogo = logoMatch ? logoMatch[1].trim() : '';
       currentGroup = groupMatch && groupMatch[1].trim() ? groupMatch[1].trim() : 'General';
       currentTvgId = tvgIdMatch ? tvgIdMatch[1].trim() : '';
       if (uaAttrMatch?.[1]) currentUserAgent = uaAttrMatch[1].trim();
       if (refAttrMatch?.[1]) currentReferer = refAttrMatch[1].trim();
+      if (macAttrMatch?.[1]) currentMacAddress = normalizeMacAddress(macAttrMatch[1].trim());
+      if (cookieAttrMatch?.[1]) currentCookie = cookieAttrMatch[1].trim();
+      if (tokenAttrMatch?.[1]) currentAuthToken = tokenAttrMatch[1].trim();
 
       // Strip any quotes/attributes first to find the comma separating metadata from channel title
       const commaIndex = extInfLine.lastIndexOf(',');
@@ -253,7 +601,7 @@ export function parseM3U(content: string): Channel[] {
         const afterComma = extInfLine.slice(commaIndex + 1).trim();
         // Check if URL was placed on the same line right after the channel title
         const inlineUrlMatch = afterComma.match(
-          /\s+(https?:\/\/|rtmp:\/\/|rtsp:\/\/|udp:\/\/|mms:\/\/|vnd\.youtube:|youtube:\/\/)(.+)$/i
+          /\s+((?:ffmpeg\s+|ffrt\d*\s+)?(?:https?:\/\/|rtmp:\/\/|rtsp:\/\/|udp:\/\/|mms:\/\/|vnd\.youtube:|youtube:\/\/))(.+)$/i
         );
         if (inlineUrlMatch && inlineUrlMatch.index !== undefined) {
           currentName = afterComma
@@ -274,12 +622,29 @@ export function parseM3U(content: string): Channel[] {
       if (grp) currentGroup = grp;
     } else if (line.toLowerCase().startsWith('#extvlcopt:')) {
       const opt = line.slice(11).trim();
-      if (opt.toLowerCase().startsWith('http-user-agent=')) {
+      const lowerOpt = opt.toLowerCase();
+      if (lowerOpt.startsWith('http-user-agent=')) {
         currentUserAgent = opt.slice(16).trim();
-      } else if (opt.toLowerCase().startsWith('http-referrer=')) {
+      } else if (lowerOpt.startsWith('http-referrer=')) {
         currentReferer = opt.slice(14).trim();
-      } else if (opt.toLowerCase().startsWith('http-referer=')) {
+      } else if (lowerOpt.startsWith('http-referer=')) {
         currentReferer = opt.slice(13).trim();
+      } else if (lowerOpt.startsWith('http-cookie=')) {
+        currentCookie = opt.slice(12).trim();
+        const mac = normalizeMacAddress(currentCookie);
+        if (mac) currentMacAddress = mac;
+      } else if (lowerOpt.startsWith('http-mac=') || lowerOpt.startsWith('mac=')) {
+        const eqIdx = opt.indexOf('=');
+        currentMacAddress = normalizeMacAddress(opt.slice(eqIdx + 1).trim());
+      } else if (lowerOpt.startsWith('http-header=')) {
+        const hdr = opt.slice(12).trim();
+        if (/^authorization\s*:/i.test(hdr)) {
+          currentAuthToken = hdr.replace(/^authorization\s*:\s*/i, '').trim();
+        } else if (/^cookie\s*:/i.test(hdr)) {
+          currentCookie = hdr.replace(/^cookie\s*:\s*/i, '').trim();
+          const mac = normalizeMacAddress(currentCookie);
+          if (mac) currentMacAddress = mac;
+        }
       }
     } else if (line.toLowerCase().startsWith('#kodiprop:')) {
       const prop = line.slice(10).trim();
@@ -289,6 +654,9 @@ export function parseM3U(content: string): Channel[] {
         const extracted = extractUrlAndPipeHeaders(`http://dummy|${val}`);
         if (extracted.userAgent) currentUserAgent = extracted.userAgent;
         if (extracted.referer) currentReferer = extracted.referer;
+        if (extracted.cookie) currentCookie = extracted.cookie;
+        if (extracted.macAddress) currentMacAddress = extracted.macAddress;
+        if (extracted.authToken) currentAuthToken = extracted.authToken;
       }
     } else if (line.toLowerCase().startsWith('#exthttp:')) {
       try {
@@ -296,14 +664,20 @@ export function parseM3U(content: string): Channel[] {
         const parsed = JSON.parse(jsonStr) as Record<string, string>;
         const ua = parsed['User-Agent'] || parsed['user-agent'] || parsed['UserAgent'];
         const ref = parsed['Referer'] || parsed['referer'] || parsed['Origin'] || parsed['origin'];
+        const ck = parsed['Cookie'] || parsed['cookie'];
+        const mac = parsed['mac'] || parsed['MAC'] || parsed['X-MAC'];
+        const auth = parsed['Authorization'] || parsed['authorization'] || parsed['token'];
         if (ua) currentUserAgent = String(ua);
         if (ref) currentReferer = String(ref);
+        if (ck) currentCookie = String(ck);
+        if (mac) currentMacAddress = normalizeMacAddress(String(mac));
+        if (auth) currentAuthToken = String(auth);
       } catch {
         // ignore invalid JSON
       }
     } else if (!line.startsWith('#')) {
       const urlStartMatch = line.match(
-        /(https?:\/\/|rtmp:\/\/|rtsp:\/\/|udp:\/\/|mms:\/\/|vnd\.youtube:|youtube:\/\/).*/i
+        /((?:ffmpeg\s+|ffrt\d*\s+)?(?:https?:\/\/|rtmp:\/\/|rtsp:\/\/|udp:\/\/|mms:\/\/|vnd\.youtube:|youtube:\/\/)).*/i
       );
       if (urlStartMatch) {
         pushChannelFromRawUrl(urlStartMatch[0]);
@@ -335,7 +709,15 @@ export function parseXSPF(content: string): Channel[] {
       const rawUrl = locationNode?.textContent?.trim() || '';
       if (!rawUrl) continue;
 
-      const { url, userAgent, referer } = extractUrlAndPipeHeaders(rawUrl);
+      const {
+        url,
+        userAgent,
+        referer,
+        cookie,
+        macAddress,
+        authToken,
+        xtreamParams,
+      } = extractUrlAndPipeHeaders(rawUrl);
       const number = channels.length + 1;
       const name = titleNode?.textContent?.trim() || `Channel ${number}`;
       const group = albumNode?.textContent?.trim() || creatorNode?.textContent?.trim() || 'General';
@@ -349,6 +731,10 @@ export function parseXSPF(content: string): Channel[] {
         logo,
         userAgent,
         referer,
+        cookie,
+        macAddress,
+        authToken,
+        xtreamParams,
         number,
       });
     }
@@ -406,9 +792,22 @@ export function parseHTMLPlaylist(content: string): Channel[] {
           : '';
 
       if (rawText && (streamUrl || logo)) {
-        const { url, userAgent, referer } = extractUrlAndPipeHeaders(
+        const {
+          url,
+          userAgent,
+          referer,
+          cookie,
+          macAddress,
+          authToken,
+          xtreamParams,
+        } = extractUrlAndPipeHeaders(
           streamUrl || 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'
         );
+        const attrMac = normalizeMacAddress(
+          el.getAttribute('data-mac') || el.getAttribute('mac') || undefined
+        );
+        const finalMac = macAddress || attrMac;
+        const finalCookie = buildMacCookieHeader(finalMac, cookie);
         const number = channels.length + 1;
         channels.push({
           id: `html-${number}-${Math.random().toString(36).slice(2, 7)}`,
@@ -418,26 +817,130 @@ export function parseHTMLPlaylist(content: string): Channel[] {
           logo,
           userAgent,
           referer,
+          cookie: finalCookie,
+          macAddress: finalMac,
+          authToken,
+          xtreamParams,
           number,
         });
       }
     });
+
+    // If no DOM elements matched, check <script> tags for embedded channel objects or stream URLs
+    if (channels.length === 0) {
+      const scripts = Array.from(doc.querySelectorAll('script'))
+        .map((s) => s.textContent || '')
+        .join('\n');
+      const objRegex =
+        /\{[^{}]*?(?:name|title)\s*:\s*["']([^"']+)["'][^{}]*?(?:url|src|file|stream|link)\s*:\s*["'](https?:\/\/[^"']+)["'][^{}]*?\}/gi;
+      let match: RegExpExecArray | null;
+      while ((match = objRegex.exec(scripts)) !== null) {
+        const {
+          url,
+          userAgent,
+          referer,
+          cookie,
+          macAddress,
+          authToken,
+          xtreamParams,
+        } = extractUrlAndPipeHeaders(match[2]);
+        const number = channels.length + 1;
+        channels.push({
+          id: `html-js-${number}-${Math.random().toString(36).slice(2, 7)}`,
+          name: match[1].trim(),
+          url,
+          group: 'General',
+          userAgent,
+          referer,
+          cookie,
+          macAddress,
+          authToken,
+          xtreamParams,
+          number,
+        });
+      }
+    }
   } catch (err) {
     console.error('Failed to parse HTML playlist:', err);
+  }
+
+  if (channels.length === 0) {
+    return parseM3U(content);
   }
 
   return channels;
 }
 
 /**
- * Automatically detects whether content is M3U, XSPF, or HTML and parses it.
+ * Automatically detects whether content is M3U, XSPF, JSON, or HTML and parses it.
  */
 export function parsePlaylistContent(content: string): Channel[] {
-  const trimmed = content.trim();
+  const trimmed = content.replace(/^\uFEFF/, '').trim();
+  if (!trimmed) return [];
+
   if (trimmed.includes('#EXTINF:')) {
     const m3u = parseM3U(trimmed);
     if (m3u.length > 0) return m3u;
   }
+
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try {
+      const parsedJson = JSON.parse(trimmed);
+      const arr = Array.isArray(parsedJson)
+        ? parsedJson
+        : Array.isArray(parsedJson?.channels)
+        ? parsedJson.channels
+        : Array.isArray(parsedJson?.js?.data)
+        ? parsedJson.js.data
+        : Array.isArray(parsedJson?.playlists?.[0]?.channels)
+        ? parsedJson.playlists[0].channels
+        : null;
+      if (arr && arr.length > 0) {
+        const jsonChannels: Channel[] = [];
+        arr.forEach((item: Record<string, unknown>, idx: number) => {
+          const rawUrl = String(
+            item.url || item.stream || item.src || item.file || item.link || item.cmd || ''
+          ).trim();
+          if (!rawUrl) return;
+          const {
+            url,
+            userAgent,
+            referer,
+            cookie,
+            macAddress,
+            authToken,
+            xtreamParams,
+          } = extractUrlAndPipeHeaders(rawUrl);
+          const itemMac = normalizeMacAddress(
+            String(item.mac || item.macAddress || item.stb_mac || '')
+          );
+          const finalMac = macAddress || itemMac;
+          const finalCookie = buildMacCookieHeader(
+            finalMac,
+            (item.cookie as string) || cookie
+          );
+          jsonChannels.push({
+            id: String(item.id || `json-${idx + 1}-${Math.random().toString(36).slice(2, 7)}`),
+            name: String(item.name || item.title || `Channel ${idx + 1}`).trim(),
+            url,
+            group: String(item.group || item.category || 'General').trim(),
+            logo: item.logo ? String(item.logo) : undefined,
+            userAgent: (item.userAgent as string) || userAgent,
+            referer: (item.referer as string) || referer,
+            cookie: finalCookie,
+            macAddress: finalMac,
+            authToken: (item.authToken as string) || (item.token as string) || authToken,
+            xtreamParams: (item.xtreamParams as XtreamStreamParams) || xtreamParams,
+            number: idx + 1,
+          });
+        });
+        if (jsonChannels.length > 0) return jsonChannels;
+      }
+    } catch {
+      // Fall through to other parsers
+    }
+  }
+
   if (trimmed.startsWith('<?xml') || trimmed.includes('<playlist') || trimmed.includes('<trackList>')) {
     const xspf = parseXSPF(trimmed);
     if (xspf.length > 0) return xspf;

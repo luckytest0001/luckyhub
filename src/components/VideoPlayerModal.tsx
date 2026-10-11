@@ -9,6 +9,8 @@ import {
 } from 'lucide-react';
 import {
   Channel,
+  DEFAULT_PLAYER_USER_AGENT,
+  buildAuthenticatedXtreamAltUrls,
   isYouTubeChannelUrl,
   openExternalChannelLink,
   repairAndNormalizeChannel,
@@ -23,6 +25,7 @@ interface VideoPlayerModalProps {
   onSelectChannel: (channel: Channel) => void;
   onClose: () => void;
   onOpenSettings?: () => void;
+  userAgent?: string;
 }
 
 function formatDuration(seconds: number): string {
@@ -38,35 +41,70 @@ function formatDuration(seconds: number): string {
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
-function buildProxyUrl(channel: Channel): string {
-  let proxy = `/api/proxy?url=${encodeURIComponent(channel.url)}`;
-  if (channel.userAgent) {
-    proxy += `&ua=${encodeURIComponent(channel.userAgent)}`;
+function appendChannelAuthQueryParams(
+  channel: Channel,
+  fallbackUa?: string,
+  overrideTargetUrl?: string
+): string {
+  const targetUrl = overrideTargetUrl || channel.url;
+  let qs = `url=${encodeURIComponent(targetUrl)}`;
+  const effectiveUa = channel.userAgent || fallbackUa || DEFAULT_PLAYER_USER_AGENT;
+  if (effectiveUa) {
+    qs += `&ua=${encodeURIComponent(effectiveUa)}`;
   }
   if (channel.referer) {
-    proxy += `&ref=${encodeURIComponent(channel.referer)}`;
+    qs += `&ref=${encodeURIComponent(channel.referer)}`;
+  }
+  if (channel.macAddress) {
+    qs += `&mac=${encodeURIComponent(channel.macAddress)}`;
+  }
+  if (channel.cookie) {
+    qs += `&cookie=${encodeURIComponent(channel.cookie)}`;
+  }
+  if (channel.authToken) {
+    qs += `&auth=${encodeURIComponent(channel.authToken)}`;
+  }
+  if (channel.xtreamParams) {
+    qs += `&xtreamServer=${encodeURIComponent(channel.xtreamParams.server)}`;
+    qs += `&xtreamUser=${encodeURIComponent(channel.xtreamParams.username)}`;
+    qs += `&xtreamPass=${encodeURIComponent(channel.xtreamParams.password)}`;
+    qs += `&xtreamStreamId=${encodeURIComponent(channel.xtreamParams.streamId)}`;
+    qs += `&xtreamType=${encodeURIComponent(channel.xtreamParams.streamType)}`;
   }
   if (channel.name) {
-    proxy += `&title=${encodeURIComponent(channel.name)}`;
+    qs += `&title=${encodeURIComponent(channel.name)}`;
   }
-  return proxy;
+  return qs;
 }
 
-function buildTranscodeUrl(channel: Channel, mode: 'remux' | 'full', seekSec = 0): string {
-  let url = `/api/transcode?mode=${mode}&url=${encodeURIComponent(channel.url)}`;
-  if (channel.userAgent) {
-    url += `&ua=${encodeURIComponent(channel.userAgent)}`;
-  }
-  if (channel.referer) {
-    url += `&ref=${encodeURIComponent(channel.referer)}`;
-  }
-  if (channel.name) {
-    url += `&title=${encodeURIComponent(channel.name)}`;
-  }
+function buildProxyUrl(
+  channel: Channel,
+  fallbackUa?: string,
+  overrideTargetUrl?: string
+): string {
+  return `/api/proxy?${appendChannelAuthQueryParams(channel, fallbackUa, overrideTargetUrl)}`;
+}
+
+function buildTranscodeUrl(
+  channel: Channel,
+  mode: 'remux' | 'full',
+  seekSec = 0,
+  fallbackUa?: string,
+  overrideTargetUrl?: string
+): string {
+  let url = `/api/transcode?mode=${mode}&${appendChannelAuthQueryParams(
+    channel,
+    fallbackUa,
+    overrideTargetUrl
+  )}`;
   if (seekSec > 0) {
     url += `&ss=${Math.floor(seekSec)}`;
   }
   return url;
+}
+
+function buildProbeUrl(channel: Channel, fallbackUa?: string): string {
+  return `/api/probe?${appendChannelAuthQueryParams(channel, fallbackUa)}`;
 }
 
 const ASPECT_RATIO_LABELS = [
@@ -93,6 +131,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
   onToggleFavorite,
   onSelectChannel,
   onClose,
+  userAgent,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -164,6 +203,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
   const seekBaseOffsetRef = useRef<number>(0);
   const isScrubbingRef = useRef<boolean>(false);
   const knownVodDurationRef = useRef<number | null>(null);
+  const userPausedRef = useRef<boolean>(false);
+  const playerControlRef = useRef<{
+    seekTo: (targetSec: number) => void;
+  } | null>(null);
 
   const currentIndex = channels.findIndex((c) => c.id === channel.id);
   const isFavChannelTitle = /\bFAV\b/i.test(channel.name);
@@ -222,6 +265,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     seekBaseOffsetRef.current = 0;
     isScrubbingRef.current = false;
     knownVodDurationRef.current = null;
+    userPausedRef.current = false;
 
     const video = videoRef.current;
     if (!video) return;
@@ -234,13 +278,29 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     let attemptToken = 0;
     let isTransitioning = false;
     let hasPlaybackStarted = false;
-    let seekBaseOffset = 0;
     let lastKnownTimestamp = 0;
+    let pendingInitialSeekSec = 0;
     let reconnectRetries = 0;
     let transitionTimer: number | null = null;
     let stallTimer: number | null = null;
     let noVideoTimer: number | null = null;
     let reconnectTimer: number | null = null;
+    let waitingWatchdogTimer: number | null = null;
+    let seekFallbackTimer: number | null = null;
+
+    const clearWaitingWatchdog = () => {
+      if (waitingWatchdogTimer !== null) {
+        window.clearTimeout(waitingWatchdogTimer);
+        waitingWatchdogTimer = null;
+      }
+    };
+
+    const clearSeekFallbackTimer = () => {
+      if (seekFallbackTimer !== null) {
+        window.clearTimeout(seekFallbackTimer);
+        seekFallbackTimer = null;
+      }
+    };
 
     const clearTimers = () => {
       if (transitionTimer !== null) {
@@ -259,6 +319,8 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         window.clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
+      clearWaitingWatchdog();
+      clearSeekFallbackTimer();
     };
 
     const destroyPlayers = () => {
@@ -300,66 +362,152 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     }
 
     const isHttpProtocol = /^https?:\/\//i.test(cleanUrl);
+    const hasMacOrXtreamAuth =
+      Boolean(normalizedChannel.macAddress) ||
+      Boolean(normalizedChannel.cookie) ||
+      Boolean(normalizedChannel.authToken) ||
+      Boolean(normalizedChannel.xtreamParams);
+
     const mustUseProxyOnly =
       !isHttpProtocol ||
       /^http:\/\//i.test(cleanUrl) ||
       Boolean(normalizedChannel.userAgent) ||
-      Boolean(normalizedChannel.referer);
+      Boolean(normalizedChannel.referer) ||
+      hasMacOrXtreamAuth;
 
     const isExplicitM3u8 = /\.m3u8(\?|$|#|&)/i.test(cleanUrl);
-    const isExplicitTsOrFlv = /\.(ts|flv)(\?|$|#|&)/i.test(cleanUrl);
+    const isExplicitTsOrFlv =
+      /\.(ts|flv)(\?|$|#|&)/i.test(cleanUrl) ||
+      /[?&](?:extension|output)=ts\b/i.test(cleanUrl);
     const isMkvAviOrLegacyContainer =
-      /\.(mkv|avi|flv|wmv|mpg|mpeg|3gp|divx)(\?|$|#|&)/i.test(cleanUrl);
+      /\.(mkv|avi|wmv|mpg|mpeg|3gp|divx)(\?|$|#|&)/i.test(cleanUrl);
+    const isExplicitNativeVod =
+      /\.(mp4|webm|mov|m4v|ogg)(\?|$|#|&)/i.test(cleanUrl) ||
+      /\/(movie|series|vod)\//i.test(cleanUrl) ||
+      /archive\.org|drive\.usercontent\.google\.com|pixeldrain\.com|dropboxusercontent\.com/i.test(
+        cleanUrl
+      );
 
-    const proxyUrl = buildProxyUrl(normalizedChannel);
-    const transcodeFullUrl = buildTranscodeUrl(normalizedChannel, 'full');
+    const proxyUrl = buildProxyUrl(normalizedChannel, userAgent);
+    const transcodeFullUrl = buildTranscodeUrl(normalizedChannel, 'full', 0, userAgent);
+    const xtreamAltUrls = buildAuthenticatedXtreamAltUrls(normalizedChannel);
+    const xtreamHlsProxyUrl =
+      xtreamAltUrls.hlsUrl && xtreamAltUrls.hlsUrl !== cleanUrl
+        ? buildProxyUrl(normalizedChannel, userAgent, xtreamAltUrls.hlsUrl)
+        : undefined;
+    const xtreamTsProxyUrl =
+      xtreamAltUrls.tsUrl && xtreamAltUrls.tsUrl !== cleanUrl
+        ? buildProxyUrl(normalizedChannel, userAgent, xtreamAltUrls.tsUrl)
+        : undefined;
 
-    const attempts: Array<{ mode: 'native' | 'hls' | 'mpegts'; url: string }> = [];
+    const attempts: Array<{
+      mode: 'native' | 'hls' | 'mpegts';
+      url: string;
+      isDirect?: boolean;
+    }> = [];
 
     if (!isHttpProtocol) {
       // RTMP / RTSP / UDP / MMS streams handled via server-side FFmpeg H.264 transcode
       attempts.push({ mode: 'native', url: transcodeFullUrl });
     } else if (isExplicitM3u8) {
+      // On deployed HTTPS apps, try Direct Browser HLS first if HTTPS & no custom headers/MAC/Xtream auth
       if (!mustUseProxyOnly && Hls.isSupported()) {
-        attempts.push({ mode: 'hls', url: cleanUrl });
+        attempts.push({ mode: 'hls', url: cleanUrl, isDirect: true });
       }
       if (Hls.isSupported()) {
         attempts.push({ mode: 'hls', url: proxyUrl });
       }
-      attempts.push({ mode: 'native', url: transcodeFullUrl });
+      // If this is an Xtream Codes live stream and .m3u8 fails, also try the authenticated .ts endpoint
+      if (xtreamTsProxyUrl && mpegts.isSupported()) {
+        attempts.push({ mode: 'mpegts', url: xtreamTsProxyUrl });
+      }
+      // Native HLS fallback (Safari / iOS / Android WebView native HLS)
+      if (!mustUseProxyOnly) {
+        attempts.push({ mode: 'native', url: cleanUrl, isDirect: true });
+      }
       attempts.push({ mode: 'native', url: proxyUrl });
+      attempts.push({ mode: 'native', url: transcodeFullUrl });
     } else if (isExplicitTsOrFlv) {
       if (mpegts.isSupported()) {
         attempts.push({ mode: 'mpegts', url: proxyUrl });
+        if (!mustUseProxyOnly) {
+          attempts.push({ mode: 'mpegts', url: cleanUrl, isDirect: true });
+        }
       }
-      attempts.push({ mode: 'native', url: transcodeFullUrl });
       if (Hls.isSupported()) {
+        if (xtreamHlsProxyUrl) {
+          attempts.push({ mode: 'hls', url: xtreamHlsProxyUrl });
+        }
         attempts.push({ mode: 'hls', url: proxyUrl });
       }
+      attempts.push({ mode: 'native', url: transcodeFullUrl });
     } else if (isMkvAviOrLegacyContainer) {
-      // For .mkv / .avi / .flv VOD movies (often with HEVC/Xvid video or AC3/EAC3 audio):
+      // For .mkv / .avi VOD movies (often with HEVC/Xvid video or AC3/EAC3 audio):
       // Transcode to universal 8-bit H.264 + stereo AAC first so both video and audio always work
       attempts.push({ mode: 'native', url: transcodeFullUrl });
       attempts.push({ mode: 'native', url: proxyUrl });
       if (!mustUseProxyOnly) {
-        attempts.push({ mode: 'native', url: cleanUrl });
+        attempts.push({ mode: 'native', url: cleanUrl, isDirect: true });
       }
-    } else {
-      // Standard .mp4, .webm, .mov, /movie/, /series/, /vod/, or extensionless URLs
+    } else if (isExplicitNativeVod) {
+      // Standard .mp4, .webm, .mov, /movie/, /series/, /vod/
       attempts.push({ mode: 'native', url: proxyUrl });
-      attempts.push({ mode: 'native', url: transcodeFullUrl });
       if (!mustUseProxyOnly) {
-        attempts.push({ mode: 'native', url: cleanUrl });
+        attempts.push({ mode: 'native', url: cleanUrl, isDirect: true });
       }
+      attempts.push({ mode: 'native', url: transcodeFullUrl });
       if (Hls.isSupported()) {
         attempts.push({ mode: 'hls', url: proxyUrl });
       }
-      if (mpegts.isSupported()) {
-        attempts.push({ mode: 'mpegts', url: proxyUrl });
+    } else {
+      // Extensionless live IPTV URLs (e.g. Xtream Codes /live/user/pass/123, /user/pass/123, Stalker play/live.php?mac=...)
+      if (normalizedChannel.xtreamParams?.streamType === 'live') {
+        if (mpegts.isSupported()) {
+          attempts.push({ mode: 'mpegts', url: xtreamTsProxyUrl || proxyUrl });
+        }
+        if (Hls.isSupported()) {
+          if (xtreamHlsProxyUrl) {
+            attempts.push({ mode: 'hls', url: xtreamHlsProxyUrl });
+          }
+          attempts.push({ mode: 'hls', url: proxyUrl });
+        }
+      } else {
+        if (Hls.isSupported()) {
+          if (!mustUseProxyOnly) {
+            attempts.push({ mode: 'hls', url: cleanUrl, isDirect: true });
+          }
+          attempts.push({ mode: 'hls', url: proxyUrl });
+        }
+        if (mpegts.isSupported()) {
+          attempts.push({ mode: 'mpegts', url: proxyUrl });
+        }
       }
+      attempts.push({ mode: 'native', url: proxyUrl });
+      attempts.push({ mode: 'native', url: transcodeFullUrl });
     }
 
+    const probeController = new AbortController();
+    const requestProbeDuration = () => {
+      if (!isMounted || (knownVodDurationRef.current && knownVodDurationRef.current > 0)) {
+        return;
+      }
+      fetch(buildProbeUrl(normalizedChannel, userAgent), {
+        signal: probeController.signal,
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data: { duration?: number | null } | null) => {
+          if (isMounted && data?.duration && Number.isFinite(data.duration) && data.duration > 0) {
+            const bestDur = Math.max(knownVodDurationRef.current || 0, data.duration);
+            knownVodDurationRef.current = bestDur;
+            setIsLiveStream(false);
+            setDuration(bestDur);
+          }
+        })
+        .catch(() => {});
+    };
+
     const safePlayVideo = () => {
+      if (userPausedRef.current) return;
       const playPromise = video.play();
       if (playPromise !== undefined) {
         playPromise.catch((err: unknown) => {
@@ -373,6 +521,63 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }
     };
 
+    const startTranscodeAt = (targetSec: number) => {
+      if (!isMounted) return;
+      clearTimers();
+
+      const safeSec = Math.max(0, Math.floor(targetSec));
+      seekBaseOffsetRef.current = safeSec;
+      lastKnownTimestamp = safeSec;
+      pendingInitialSeekSec = 0;
+
+      const transcodeIdx = attempts.findIndex((a) => a.url.includes('/api/transcode'));
+      if (transcodeIdx !== -1) {
+        currentAttemptIdx = transcodeIdx;
+      }
+
+      attemptToken += 1;
+      const myToken = attemptToken;
+      recoveredMediaError = false;
+      hasPlaybackStarted = false;
+      isTransitioning = true;
+
+      setHasError(false);
+      setIsLoading(true);
+      setIsPlaying(true);
+      userPausedRef.current = false;
+
+      destroyPlayers();
+      video.removeAttribute('src');
+      video.load();
+
+      transitionTimer = window.setTimeout(() => {
+        if (!isMounted || myToken !== attemptToken) return;
+        isTransitioning = false;
+
+        stallTimer = window.setTimeout(() => {
+          if (!isMounted || myToken !== attemptToken || hasPlaybackStarted) return;
+          if (reconnectRetries < 5) {
+            reconnectRetries += 1;
+            startTranscodeAt(safeSec);
+          } else {
+            triggerStreamError();
+          }
+        }, 22000);
+
+        const seekParam = safeSec > 0 ? `&ss=${safeSec}` : '';
+        video.src = `${transcodeFullUrl}${seekParam}&_rc=${Date.now()}`;
+        video.load();
+        safePlayVideo();
+
+        // Also refresh probe duration once FFmpeg has parsed the input header
+        window.setTimeout(() => {
+          if (isMounted && myToken === attemptToken) {
+            requestProbeDuration();
+          }
+        }, 1200);
+      }, 45);
+    };
+
     const advanceToNextAttempt = (fromToken: number) => {
       if (!isMounted || fromToken !== attemptToken) return;
       runAttempt(currentAttemptIdx + 1);
@@ -380,6 +585,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
 
     const jumpToTranscodeOrNext = (fromToken: number) => {
       if (!isMounted || fromToken !== attemptToken) return;
+      if (lastKnownTimestamp > 2) {
+        startTranscodeAt(lastKnownTimestamp);
+        return;
+      }
       const transcodeIdx = attempts.findIndex(
         (a, i) => i > currentAttemptIdx && a.url.includes('/api/transcode')
       );
@@ -390,7 +599,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }
     };
 
-    const runAttempt = (idx: number) => {
+    const runAttempt = (idx: number, resumeAtSec = 0) => {
       if (!isMounted) return;
       clearTimers();
 
@@ -405,6 +614,15 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       const attempt = attempts[idx];
       recoveredMediaError = false;
       hasPlaybackStarted = false;
+      pendingInitialSeekSec = resumeAtSec > 1 ? resumeAtSec : 0;
+      let preStartNetworkErrors = 0;
+
+      if (attempt.url.includes('/api/transcode') && pendingInitialSeekSec > 0) {
+        startTranscodeAt(pendingInitialSeekSec);
+        return;
+      }
+
+      seekBaseOffsetRef.current = 0;
 
       // Guard against asynchronous error events fired by detaching previous media sources
       isTransitioning = true;
@@ -417,7 +635,11 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         isTransitioning = false;
 
         // Set a safety stall timeout in case this attempt hangs without starting playback
-        const timeoutMs = attempt.url.includes('/api/transcode') ? 22000 : 14000;
+        const timeoutMs = attempt.isDirect
+          ? 6500
+          : attempt.url.includes('/api/transcode')
+          ? 20000
+          : 12000;
         stallTimer = window.setTimeout(() => {
           if (!isMounted || myToken !== attemptToken || hasPlaybackStarted) return;
           advanceToNextAttempt(myToken);
@@ -428,9 +650,13 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
             enableWorker: true,
             lowLatencyMode: false,
             backBufferLength: 60,
-            manifestLoadingTimeOut: 10000,
-            manifestLoadingMaxRetry: 1,
-            levelLoadingTimeOut: 10000,
+            startPosition: pendingInitialSeekSec > 0 ? pendingInitialSeekSec : -1,
+            manifestLoadingTimeOut: attempt.isDirect ? 5500 : 10000,
+            manifestLoadingMaxRetry: attempt.isDirect ? 0 : 1,
+            levelLoadingTimeOut: attempt.isDirect ? 5500 : 10000,
+            levelLoadingMaxRetry: attempt.isDirect ? 0 : 1,
+            fragLoadingTimeOut: attempt.isDirect ? 6500 : 12000,
+            fragLoadingMaxRetry: attempt.isDirect ? 0 : 2,
           });
           hls.loadSource(attempt.url);
           hls.attachMedia(video);
@@ -450,6 +676,14 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
               jumpToTranscodeOrNext(myToken);
               return;
             }
+            if (pendingInitialSeekSec > 0) {
+              try {
+                video.currentTime = pendingInitialSeekSec;
+              } catch {
+                // ignore
+              }
+              pendingInitialSeekSec = 0;
+            }
             safePlayVideo();
           });
 
@@ -462,25 +696,53 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
               Number.isFinite(data.details.totalduration) &&
               data.details.totalduration > 0
             ) {
-              setDuration(data.details.totalduration);
+              const bestDur = Math.max(
+                knownVodDurationRef.current || 0,
+                data.details.totalduration
+              );
+              knownVodDurationRef.current = bestDur;
+              setDuration(bestDur);
             }
           });
 
           hls.on(Hls.Events.ERROR, (_event, data) => {
             if (!isMounted || myToken !== attemptToken) return;
+            // Fast fallback if network/CORS/segment error happens before playback has even started
+            if (!hasPlaybackStarted && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              preStartNetworkErrors += 1;
+              if (attempt.isDirect || data.fatal || preStartNetworkErrors >= 2) {
+                advanceToNextAttempt(myToken);
+                return;
+              }
+            }
             if (data.fatal) {
               if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recoveredMediaError) {
                 recoveredMediaError = true;
                 hls?.recoverMediaError();
-              } else if (hasPlaybackStarted && reconnectRetries < 5) {
+              } else if ((hasPlaybackStarted || lastKnownTimestamp > 1) && reconnectRetries < 6) {
                 reconnectRetries += 1;
                 const savedTime = lastKnownTimestamp;
+                setHasError(false);
                 setIsLoading(true);
+                if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
                 reconnectTimer = window.setTimeout(() => {
                   if (!isMounted || myToken !== attemptToken) return;
-                  hls?.startLoad(savedTime > 1 ? savedTime : -1);
-                  safePlayVideo();
-                }, 1200);
+                  if (attempt.isDirect) {
+                    const proxyHlsIdx = attempts.findIndex(
+                      (a, i) => i > currentAttemptIdx && a.mode === 'hls' && !a.isDirect
+                    );
+                    if (proxyHlsIdx !== -1) {
+                      runAttempt(proxyHlsIdx, savedTime);
+                      return;
+                    }
+                  }
+                  if (reconnectRetries <= 3 && hls) {
+                    hls.startLoad(savedTime > 1 ? savedTime : -1);
+                    safePlayVideo();
+                  } else {
+                    startTranscodeAt(savedTime);
+                  }
+                }, 1000);
               } else {
                 advanceToNextAttempt(myToken);
               }
@@ -505,41 +767,189 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
 
           mpegtsPlayer.on(mpegts.Events.ERROR, () => {
             if (!isMounted || myToken !== attemptToken) return;
+            if (hasPlaybackStarted && reconnectRetries < 4) {
+              reconnectRetries += 1;
+              setIsLoading(true);
+              reconnectTimer = window.setTimeout(() => {
+                if (!isMounted || myToken !== attemptToken) return;
+                runAttempt(currentAttemptIdx, lastKnownTimestamp);
+              }, 1000);
+              return;
+            }
             advanceToNextAttempt(myToken);
           });
         } else {
           video.src = attempt.url;
           video.load();
+          if (attempt.url.includes('/api/transcode')) {
+            window.setTimeout(() => {
+              if (isMounted && myToken === attemptToken) {
+                requestProbeDuration();
+              }
+            }, 1200);
+          }
           safePlayVideo();
         }
       }, 45);
     };
 
+    const performSeek = (targetSec: number) => {
+      if (!isMounted) return;
+      clearSeekFallbackTimer();
+      clearWaitingWatchdog();
+
+      const safeTarget = Math.max(0, targetSec);
+      lastKnownTimestamp = safeTarget;
+      reconnectRetries = 0;
+      userPausedRef.current = false;
+      setHasError(false);
+      setIsPlaying(true);
+
+      const activeAttempt = attempts[currentAttemptIdx];
+      const currentSrc = video.src || activeAttempt?.url || '';
+      const isCurrentlyTranscoding =
+        currentSrc.includes('/api/transcode') ||
+        Boolean(activeAttempt?.url.includes('/api/transcode'));
+
+      // 1. If already playing via FFmpeg transcode, seek via server-side FFmpeg -ss
+      if (isCurrentlyTranscoding) {
+        startTranscodeAt(safeTarget);
+        return;
+      }
+
+      // 2. If playing via mpegts.js, switch to FFmpeg transcode to seek
+      if (activeAttempt?.mode === 'mpegts' && mpegtsPlayer) {
+        startTranscodeAt(safeTarget);
+        return;
+      }
+
+      // 3. If playing via Hls.js on a VOD stream, seek natively within Hls.js first
+      if (activeAttempt?.mode === 'hls' && hls) {
+        seekBaseOffsetRef.current = 0;
+        setIsLoading(true);
+        try {
+          video.currentTime = safeTarget;
+          hls.startLoad(safeTarget);
+        } catch {
+          startTranscodeAt(safeTarget);
+          return;
+        }
+        safePlayVideo();
+        const tokenAtSeek = attemptToken;
+        seekFallbackTimer = window.setTimeout(() => {
+          seekFallbackTimer = null;
+          if (!isMounted || tokenAtSeek !== attemptToken) return;
+          if (Math.abs(video.currentTime - safeTarget) > 18 && !video.seeking) {
+            startTranscodeAt(safeTarget);
+          }
+        }, 6000);
+        return;
+      }
+
+      // 4. Native HTML5 <video> playback (/api/proxy or direct MP4/WebM/MKV)
+      let isSeekableNatively = false;
+      if (video.seekable && video.seekable.length > 0) {
+        for (let i = 0; i < video.seekable.length; i++) {
+          if (
+            safeTarget >= video.seekable.start(i) - 2 &&
+            safeTarget <= video.seekable.end(i) + 2
+          ) {
+            isSeekableNatively = true;
+            break;
+          }
+        }
+      }
+
+      // If the browser reports that targetSec is outside seekable ranges, immediately seek via /api/transcode
+      if (!isSeekableNatively && safeTarget > 3) {
+        startTranscodeAt(safeTarget);
+        return;
+      }
+
+      seekBaseOffsetRef.current = 0;
+      setIsLoading(true);
+      try {
+        video.currentTime = safeTarget;
+      } catch {
+        startTranscodeAt(safeTarget);
+        return;
+      }
+      safePlayVideo();
+
+      const tokenAtSeek = attemptToken;
+      seekFallbackTimer = window.setTimeout(() => {
+        seekFallbackTimer = null;
+        if (!isMounted || tokenAtSeek !== attemptToken) return;
+        const currentSrcNow = video.src || '';
+        if (currentSrcNow.includes('/api/transcode')) return;
+
+        // If the browser snapped currentTime back (e.g. upstream ignored Range header), fall back to /api/transcode
+        if (!video.seeking && Math.abs(video.currentTime - safeTarget) > 14) {
+          startTranscodeAt(safeTarget);
+          return;
+        }
+
+        // If still stuck seeking after 7.5s, fall back to /api/transcode
+        if (video.seeking) {
+          seekFallbackTimer = window.setTimeout(() => {
+            seekFallbackTimer = null;
+            if (!isMounted || tokenAtSeek !== attemptToken) return;
+            if (video.seeking || Math.abs(video.currentTime - safeTarget) > 14) {
+              startTranscodeAt(safeTarget);
+            }
+          }, 6000);
+        }
+      }, 1500);
+    };
+
+    playerControlRef.current = { seekTo: performSeek };
+
     const confirmOrWatchVideoTrack = () => {
       if (!isMounted || isTransitioning) return;
       const activeAttempt = attempts[currentAttemptIdx];
-      const isTranscodeAttempt = Boolean(activeAttempt?.url.includes('/api/transcode'));
+      const currentSrc = video.src || activeAttempt?.url || '';
+      const isTranscodeAttempt =
+        currentSrc.includes('/api/transcode') ||
+        Boolean(activeAttempt?.url.includes('/api/transcode'));
+      const isStreamingEngine =
+        activeAttempt?.mode === 'hls' || activeAttempt?.mode === 'mpegts';
       const hasVideoDimensions = video.videoWidth > 0 && video.videoHeight > 0;
 
-      if (hasVideoDimensions || isTranscodeAttempt) {
+      if (hasVideoDimensions || isTranscodeAttempt || isStreamingEngine) {
         hasPlaybackStarted = true;
         reconnectRetries = 0;
+        clearWaitingWatchdog();
         if (stallTimer !== null) {
           window.clearTimeout(stallTimer);
           stallTimer = null;
         }
-        if (noVideoTimer !== null) {
+        if (hasVideoDimensions && noVideoTimer !== null) {
           window.clearTimeout(noVideoTimer);
           noVideoTimer = null;
         }
         setHasError(false);
         setIsLoading(false);
-        setIsPlaying(true);
+        if (!userPausedRef.current) {
+          setIsPlaying(true);
+        }
+
+        // If a native or streaming container plays audio for 5.5s with 0x0 video dimensions (e.g. HEVC in MP4/TS),
+        // switch to FFmpeg H.264 transcode.
+        if (!hasVideoDimensions && !isTranscodeAttempt && noVideoTimer === null) {
+          const tokenAtStart = attemptToken;
+          noVideoTimer = window.setTimeout(() => {
+            noVideoTimer = null;
+            if (!isMounted || isTransitioning || tokenAtStart !== attemptToken) return;
+            if ((video.videoWidth === 0 || video.videoHeight === 0) && video.currentTime > 1.5) {
+              jumpToTranscodeOrNext(tokenAtStart);
+            }
+          }, 5500);
+        }
         return;
       }
 
-      // Audio/metadata started on a non-transcode attempt, but videoWidth is still 0.
-      // Wait up to 1400ms for video dimensions; if still 0, switch to FFmpeg H.264 transcoding.
+      // Audio/metadata started on a native non-transcode attempt, but videoWidth is still 0.
+      // Wait up to 4500ms for video dimensions; if still 0, switch to FFmpeg H.264 transcoding.
       if (noVideoTimer === null) {
         const tokenAtStart = attemptToken;
         noVideoTimer = window.setTimeout(() => {
@@ -550,12 +960,13 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
           } else {
             confirmOrWatchVideoTrack();
           }
-        }, 1400);
+        }, 4500);
       }
     };
 
     const handlePlaying = () => {
       if (!isMounted || isTransitioning) return;
+      clearWaitingWatchdog();
       confirmOrWatchVideoTrack();
     };
 
@@ -566,9 +977,54 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }
     };
 
+    const scheduleWaitingReconnectWatchdog = () => {
+      if (!isMounted || isTransitioning || !hasPlaybackStarted || userPausedRef.current) return;
+      clearWaitingWatchdog();
+      const tokenAtWait = attemptToken;
+      const timeAtWait = lastKnownTimestamp;
+      waitingWatchdogTimer = window.setTimeout(() => {
+        waitingWatchdogTimer = null;
+        if (!isMounted || isTransitioning || tokenAtWait !== attemptToken || userPausedRef.current) {
+          return;
+        }
+        const nowEffective = seekBaseOffsetRef.current + video.currentTime;
+        const isStillStuck = Math.abs(nowEffective - timeAtWait) < 0.4 || video.readyState < 3;
+        if (isStillStuck && reconnectRetries < 6) {
+          reconnectRetries += 1;
+          const savedTime = Math.max(timeAtWait, nowEffective);
+          setHasError(false);
+          setIsLoading(true);
+          const activeAttempt = attempts[currentAttemptIdx];
+          if (activeAttempt?.mode === 'hls' && hls && reconnectRetries <= 2) {
+            hls.startLoad(savedTime > 1 ? savedTime : -1);
+            safePlayVideo();
+          } else if (savedTime > 1 || (knownVodDurationRef.current && knownVodDurationRef.current > 0)) {
+            startTranscodeAt(savedTime);
+          } else {
+            runAttempt(currentAttemptIdx, 0);
+          }
+        }
+      }, 9000);
+    };
+
     const handleWaiting = () => {
       if (!isMounted || isTransitioning) return;
       setIsLoading(true);
+      scheduleWaitingReconnectWatchdog();
+    };
+
+    const handleEnded = () => {
+      if (!isMounted || isTransitioning) return;
+      const effectiveDur = knownVodDurationRef.current || duration || 0;
+      const effectiveNow = seekBaseOffsetRef.current + video.currentTime;
+      // If a VOD stream (especially chunked /api/transcode) ended more than 15s before its actual duration,
+      // the upstream connection dropped prematurely — automatically reconnect at effectiveNow!
+      if (effectiveDur > 30 && effectiveNow < effectiveDur - 15 && reconnectRetries < 6) {
+        reconnectRetries += 1;
+        setHasError(false);
+        setIsLoading(true);
+        startTranscodeAt(effectiveNow);
+      }
     };
 
     const handleVideoError = () => {
@@ -578,7 +1034,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       if (activeAttempt?.mode === 'hls' && hls) return;
       if (activeAttempt?.mode === 'mpegts' && mpegtsPlayer) return;
 
-      if (hasPlaybackStarted && reconnectRetries < 5) {
+      if ((hasPlaybackStarted || lastKnownTimestamp > 1) && reconnectRetries < 6) {
         reconnectRetries += 1;
         const savedTime = lastKnownTimestamp;
         setHasError(false);
@@ -587,40 +1043,45 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         reconnectTimer = window.setTimeout(() => {
           if (!isMounted) return;
           const currentSrc = video.src || activeAttempt?.url || '';
-          if (currentSrc.includes('/api/transcode')) {
-            seekBaseOffsetRef.current = savedTime > 1 ? savedTime : 0;
-            const base = currentSrc
-              .replace(/([?&])ss=\d+/g, '')
-              .replace(/([?&])_rc=\d+/g, '')
-              .replace(/[?&]+$/, '');
-            const sep = base.includes('?') ? '&' : '?';
-            video.src = `${base}${sep}ss=${Math.floor(seekBaseOffsetRef.current)}&_rc=${Date.now()}`;
-            video.load();
-            safePlayVideo();
-          } else if (currentSrc) {
-            seekBaseOffsetRef.current = 0;
-            const base = currentSrc.replace(/([?&])_rc=\d+/g, '').replace(/[?&]+$/, '');
-            const sep = base.includes('?') ? '&' : '?';
-            video.src = `${base}${sep}_rc=${Date.now()}`;
-            video.load();
-            if (savedTime > 1) {
-              video.addEventListener(
-                'loadedmetadata',
-                () => {
-                  try {
-                    video.currentTime = savedTime;
-                  } catch {
-                    // ignore
-                  }
-                  safePlayVideo();
-                },
-                { once: true }
-              );
-            } else {
-              safePlayVideo();
-            }
+          const isTranscode = currentSrc.includes('/api/transcode');
+
+          // If already on transcode, or if native reconnect already failed once, or if direct URL failed mid-stream:
+          // reconnect via FFmpeg transcode at the exact savedTime!
+          if (isTranscode || reconnectRetries >= 2 || activeAttempt?.isDirect) {
+            startTranscodeAt(savedTime);
+            return;
           }
-        }, 1200);
+
+          // First retry on native /api/proxy: reload proxyUrl and restore currentTime
+          seekBaseOffsetRef.current = 0;
+          const sep = proxyUrl.includes('?') ? '&' : '?';
+          video.src = `${proxyUrl}${sep}_rc=${Date.now()}`;
+          video.load();
+          if (savedTime > 1) {
+            const onMeta = () => {
+              if (!isMounted) return;
+              try {
+                video.currentTime = savedTime;
+              } catch {
+                startTranscodeAt(savedTime);
+                return;
+              }
+              safePlayVideo();
+              window.setTimeout(() => {
+                if (!isMounted) return;
+                if (
+                  !video.src.includes('/api/transcode') &&
+                  Math.abs(video.currentTime - savedTime) > 15
+                ) {
+                  startTranscodeAt(savedTime);
+                }
+              }, 2200);
+            };
+            video.addEventListener('loadedmetadata', onMeta, { once: true });
+          } else {
+            safePlayVideo();
+          }
+        }, 1000);
         return;
       }
 
@@ -630,6 +1091,9 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     const handleTimeUpdate = () => {
       if (isTransitioning) return;
       const effectiveTime = seekBaseOffsetRef.current + video.currentTime;
+      if (video.currentTime > 0.2) {
+        clearWaitingWatchdog();
+      }
       lastKnownTimestamp = effectiveTime;
       if (!isScrubbingRef.current) {
         setCurrentTime(effectiveTime);
@@ -639,7 +1103,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         Number.isFinite(video.duration) &&
         video.duration > 0
       ) {
-        const bestDur = Math.max(knownVodDurationRef.current || 0, video.duration);
+        const bestDur = Math.max(
+          knownVodDurationRef.current || 0,
+          seekBaseOffsetRef.current + video.duration
+        );
         knownVodDurationRef.current = bestDur;
         setIsLiveStream(false);
         setDuration(bestDur);
@@ -651,8 +1118,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       // Watchdog: if audio has been playing for >= 0.8s on a non-transcode attempt
       // but videoWidth is 0 (or 0 video frames decoded after 1.5s), switch to FFmpeg transcode
       const activeAttempt = attempts[currentAttemptIdx];
+      const currentSrc = video.src || activeAttempt?.url || '';
       if (
         activeAttempt &&
+        !currentSrc.includes('/api/transcode') &&
         !activeAttempt.url.includes('/api/transcode') &&
         video.currentTime >= 0.8
       ) {
@@ -672,12 +1141,24 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
 
     const handleLoadedMetadata = () => {
       if (!isMounted || isTransitioning) return;
+      if (pendingInitialSeekSec > 0 && !video.src.includes('/api/transcode')) {
+        const target = pendingInitialSeekSec;
+        pendingInitialSeekSec = 0;
+        try {
+          video.currentTime = target;
+        } catch {
+          // ignore
+        }
+      }
       if (
         video.duration &&
         Number.isFinite(video.duration) &&
         video.duration > 0
       ) {
-        const bestDur = Math.max(knownVodDurationRef.current || 0, video.duration);
+        const bestDur = Math.max(
+          knownVodDurationRef.current || 0,
+          seekBaseOffsetRef.current + video.duration
+        );
         knownVodDurationRef.current = bestDur;
         setIsLiveStream(false);
         setDuration(bestDur);
@@ -697,10 +1178,27 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         Number.isFinite(video.duration) &&
         video.duration > 0
       ) {
-        const bestDur = Math.max(knownVodDurationRef.current || 0, video.duration);
+        const bestDur = Math.max(
+          knownVodDurationRef.current || 0,
+          seekBaseOffsetRef.current + video.duration
+        );
         knownVodDurationRef.current = bestDur;
         setIsLiveStream(false);
         setDuration(bestDur);
+      }
+    };
+
+    const handleNetworkOnline = () => {
+      if (!isMounted || userPausedRef.current) return;
+      reconnectRetries = 0;
+      if (hasError || video.error || video.readyState < 3) {
+        setHasError(false);
+        setIsLoading(true);
+        if (lastKnownTimestamp > 1) {
+          startTranscodeAt(lastKnownTimestamp);
+        } else {
+          runAttempt(0);
+        }
       }
     };
 
@@ -708,35 +1206,20 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     video.addEventListener('canplay', handlePlaying);
     video.addEventListener('resize', handleResize);
     video.addEventListener('waiting', handleWaiting);
+    video.addEventListener('stalled', handleWaiting);
+    video.addEventListener('ended', handleEnded);
     video.addEventListener('error', handleVideoError);
     video.addEventListener('timeupdate', handleTimeUpdate);
     video.addEventListener('loadedmetadata', handleLoadedMetadata);
     video.addEventListener('durationchange', handleDurationChange);
+    window.addEventListener('online', handleNetworkOnline);
 
-    const probeController = new AbortController();
-    fetch(
-      `/api/probe?url=${encodeURIComponent(normalizedChannel.url)}${
-        normalizedChannel.userAgent ? `&ua=${encodeURIComponent(normalizedChannel.userAgent)}` : ''
-      }${normalizedChannel.referer ? `&ref=${encodeURIComponent(normalizedChannel.referer)}` : ''}${
-        normalizedChannel.name ? `&title=${encodeURIComponent(normalizedChannel.name)}` : ''
-      }`,
-      { signal: probeController.signal }
-    )
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data: { duration?: number | null } | null) => {
-        if (isMounted && data?.duration && Number.isFinite(data.duration) && data.duration > 0) {
-          const bestDur = Math.max(knownVodDurationRef.current || 0, data.duration);
-          knownVodDurationRef.current = bestDur;
-          setIsLiveStream(false);
-          setDuration(bestDur);
-        }
-      })
-      .catch(() => {});
-
+    requestProbeDuration();
     runAttempt(0);
 
     return () => {
       isMounted = false;
+      playerControlRef.current = null;
       probeController.abort();
       clearTimers();
       destroyPlayers();
@@ -744,10 +1227,13 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       video.removeEventListener('canplay', handlePlaying);
       video.removeEventListener('resize', handleResize);
       video.removeEventListener('waiting', handleWaiting);
+      video.removeEventListener('stalled', handleWaiting);
+      video.removeEventListener('ended', handleEnded);
       video.removeEventListener('error', handleVideoError);
       video.removeEventListener('timeupdate', handleTimeUpdate);
       video.removeEventListener('loadedmetadata', handleLoadedMetadata);
       video.removeEventListener('durationchange', handleDurationChange);
+      window.removeEventListener('online', handleNetworkOnline);
     };
   }, [channel]);
 
@@ -755,9 +1241,11 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     const video = videoRef.current;
     if (!video) return;
     if (isPlaying) {
+      userPausedRef.current = true;
       video.pause();
       setIsPlaying(false);
     } else {
+      userPausedRef.current = false;
       video.play().catch(() => {});
       setIsPlaying(true);
     }
@@ -769,38 +1257,8 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     const clampedTime = Math.min(effectiveDuration, Math.max(0, targetTime));
     setCurrentTime(clampedTime);
     setScrubTime(clampedTime);
-    const video = videoRef.current;
-    if (!video) return;
-
-    const startTranscodeSeek = (sec: number) => {
-      setIsLoading(true);
-      seekBaseOffsetRef.current = sec;
-      const normalized = repairAndNormalizeChannel(channel);
-      const transcodeBase = buildTranscodeUrl(normalized, 'full');
-      video.src = `${transcodeBase}&ss=${Math.floor(sec)}&_rc=${Date.now()}`;
-      video.load();
-      video.play().catch(() => {});
-    };
-
-    if (video.src && video.src.includes('/api/transcode')) {
-      startTranscodeSeek(clampedTime);
-    } else {
-      seekBaseOffsetRef.current = 0;
-      try {
-        video.currentTime = clampedTime;
-      } catch {
-        startTranscodeSeek(clampedTime);
-        return;
-      }
-      window.setTimeout(() => {
-        if (!videoRef.current) return;
-        if (
-          !videoRef.current.src.includes('/api/transcode') &&
-          Math.abs(videoRef.current.currentTime - clampedTime) > 12
-        ) {
-          startTranscodeSeek(clampedTime);
-        }
-      }, 650);
+    if (playerControlRef.current) {
+      playerControlRef.current.seekTo(clampedTime);
     }
   };
 
