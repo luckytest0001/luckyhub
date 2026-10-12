@@ -313,26 +313,158 @@ export function parseXtreamAndMacParams(rawUrl: string): {
 }
 
 /**
- * Generates alternate Xtream Codes stream URLs (e.g. .m3u8 and .ts variants with /live/ prefix)
- * so the player can seamlessly switch between HLS and MPEG-TS while preserving authentication.
+ * Generates alternate Xtream Codes stream URLs (e.g. .m3u8 and .ts variants for live,
+ * and .mp4 / .mkv variants for VOD movie/series) so the player can seamlessly switch
+ * containers while preserving authentication.
  */
 export function buildAuthenticatedXtreamAltUrls(channel: Channel): {
   hlsUrl?: string;
   tsUrl?: string;
   rawLiveUrl?: string;
+  vodMp4Url?: string;
+  vodMkvUrl?: string;
 } {
   const xp = channel.xtreamParams || parseXtreamAndMacParams(channel.url).xtreamParams;
-  if (!xp || xp.streamType !== 'live') return {};
+  if (!xp) return {};
   const base = xp.server.replace(/\/+$/, '');
   const u = encodeURIComponent(xp.username);
   const p = encodeURIComponent(xp.password);
   const id = encodeURIComponent(xp.streamId);
   const qs = xp.queryParams ? `?${xp.queryParams}` : '';
+  if (xp.streamType === 'live') {
+    return {
+      hlsUrl: `${base}/live/${u}/${p}/${id}.m3u8${qs}`,
+      tsUrl: `${base}/live/${u}/${p}/${id}.ts${qs}`,
+      rawLiveUrl: `${base}/live/${u}/${p}/${id}${qs}`,
+    };
+  }
   return {
-    hlsUrl: `${base}/live/${u}/${p}/${id}.m3u8${qs}`,
-    tsUrl: `${base}/live/${u}/${p}/${id}.ts${qs}`,
-    rawLiveUrl: `${base}/live/${u}/${p}/${id}${qs}`,
+    vodMp4Url: `${base}/${xp.streamType}/${u}/${p}/${id}.mp4${qs}`,
+    vodMkvUrl: `${base}/${xp.streamType}/${u}/${p}/${id}.mkv${qs}`,
   };
+}
+
+/**
+ * Resolves Archive.org /details/<id> or truncated /download/<id> URLs, Google Drive alternate
+ * download links, and truncated VOD filenames directly in the browser (works 100% client-side
+ * on GitHub Pages even without a backend server).
+ */
+export async function resolveClientSideVodUrls(
+  channel: Channel,
+  signal?: AbortSignal
+): Promise<string[]> {
+  const results: string[] = [];
+  const pushUnique = (u?: string) => {
+    if (u && /^https?:\/\//i.test(u) && !results.includes(u)) {
+      results.push(u);
+    }
+  };
+
+  const cleanUrl = normalizeVodMediaUrl(channel.url || '');
+
+  // 1. Archive.org /details/<id> or /download/<id>/<partial>
+  const archiveMatch = cleanUrl.match(
+    /^https?:\/\/(?:www\.)?archive\.org\/(?:details|download)\/([^/?#]+)(?:\/([^?#]*))?/i
+  );
+  if (archiveMatch) {
+    const itemId = archiveMatch[1];
+    const subPath = archiveMatch[2] ? safeDecodeURIComponent(archiveMatch[2]).trim() : '';
+    const hasVideoExt = /\.(mp4|mkv|webm|mov|m4v|avi|ts|flv|ogg)$/i.test(subPath);
+
+    // If it already has a full video filename on /download/, include it first
+    if (hasVideoExt && /\/download\//i.test(cleanUrl)) {
+      pushUnique(cleanUrl);
+    }
+
+    try {
+      const metaRes = await fetch(
+        `https://archive.org/metadata/${encodeURIComponent(itemId)}`,
+        { signal }
+      );
+      if (metaRes.ok) {
+        const metaJson = (await metaRes.json()) as {
+          files?: Array<{ name?: string; format?: string }>;
+        };
+        const files = metaJson.files || [];
+        const videoFiles = files.filter(
+          (f) => f.name && /\.(mp4|mkv|webm|mov|m4v|avi|ogg)$/i.test(f.name)
+        );
+        // Prefer browser-native MP4/WebM first, then MKV/others
+        videoFiles.sort((a, b) => {
+          const aMp4 = /\.(mp4|webm|m4v|mov)$/i.test(a.name || '') ? 0 : 1;
+          const bMp4 = /\.(mp4|webm|m4v|mov)$/i.test(b.name || '') ? 0 : 1;
+          return aMp4 - bMp4;
+        });
+
+        const cleanTitle = (channel.name || '').trim().toLowerCase();
+        const cleanSub = subPath.toLowerCase();
+
+        const matchedList = [
+          ...videoFiles.filter((f) => cleanSub && f.name!.toLowerCase() === cleanSub),
+          ...videoFiles.filter((f) => cleanSub && f.name!.toLowerCase().startsWith(cleanSub)),
+          ...videoFiles.filter(
+            (f) =>
+              cleanTitle &&
+              (f.name!.toLowerCase().startsWith(cleanTitle) ||
+                f.name!.toLowerCase().includes(cleanTitle))
+          ),
+          ...videoFiles,
+        ];
+
+        for (const matched of matchedList.slice(0, 3)) {
+          if (matched?.name) {
+            const encodedName = matched.name
+              .split('/')
+              .map((seg) => encodeURIComponent(seg))
+              .join('/');
+            pushUnique(`https://archive.org/download/${itemId}/${encodedName}`);
+          }
+        }
+      }
+    } catch {
+      // Ignore metadata fetch errors; fall back to heuristic reconstruction below
+    }
+  }
+
+  // 2. Heuristic recovery if a VOD URL was truncated at a space and channel.name has the full title
+  const hasMediaExt = /\.(mp4|mkv|m3u8|ts|webm|avi|mov|m4v|flv|ogg)(\?|$)/i.test(cleanUrl);
+  if (!hasMediaExt && channel.name) {
+    try {
+      const uObj = new URL(cleanUrl);
+      const pathParts = uObj.pathname.split('/');
+      const lastSeg = safeDecodeURIComponent(pathParts[pathParts.length - 1] || '').trim();
+      const cleanTitle = channel.name.trim();
+      if (
+        lastSeg &&
+        cleanTitle.toLowerCase().startsWith(lastSeg.toLowerCase()) &&
+        cleanTitle.length > lastSeg.length
+      ) {
+        const baseDir = pathParts.slice(0, -1).join('/');
+        const encodedTitle = encodeURIComponent(cleanTitle);
+        if (/\.(mp4|mkv|webm|mov|m4v|avi)$/i.test(cleanTitle)) {
+          pushUnique(`${uObj.origin}${baseDir}/${encodedTitle}${uObj.search}`);
+        } else {
+          pushUnique(`${uObj.origin}${baseDir}/${encodedTitle}.mp4${uObj.search}`);
+          pushUnique(`${uObj.origin}${baseDir}/${encodedTitle}.mkv${uObj.search}`);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // 3. Google Drive alternate direct download URLs
+  const gdriveIdMatch = cleanUrl.match(/[?&]id=([a-zA-Z0-9_-]+)/i);
+  if (gdriveIdMatch?.[1] && /google\.com/i.test(cleanUrl)) {
+    const gid = gdriveIdMatch[1];
+    pushUnique(
+      `https://drive.usercontent.google.com/download?id=${gid}&export=download&confirm=t`
+    );
+    pushUnique(`https://drive.google.com/uc?export=download&confirm=t&id=${gid}`);
+  }
+
+  pushUnique(cleanUrl);
+  return results;
 }
 
 /**

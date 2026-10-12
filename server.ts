@@ -1167,7 +1167,7 @@ async function connectUpstreamWithFallbacks(
   for (const candidateUrl of urlsToTry) {
     for (const profile of uaProfiles) {
       try {
-        const res = await requestSingleAttempt(candidateUrl, {
+        let res = await requestSingleAttempt(candidateUrl, {
           userAgent: profile.ua,
           referer: profile.ref,
           cookie: effectiveCookie,
@@ -1175,7 +1175,23 @@ async function connectUpstreamWithFallbacks(
           authHeader: profile.auth,
           range: options.range,
         });
-        const status = res.statusCode || 0;
+        let status = res.statusCode || 0;
+        // If upstream VOD server rejected the Range header (400/403/416/501) on initial byte-0 request, retry without Range
+        if (
+          options.range &&
+          /^bytes=0-/i.test(options.range) &&
+          (status === 400 || status === 403 || status === 416 || status === 501)
+        ) {
+          res.destroy();
+          res = await requestSingleAttempt(candidateUrl, {
+            userAgent: profile.ua,
+            referer: profile.ref,
+            cookie: effectiveCookie,
+            macAddress: effectiveMac,
+            authHeader: profile.auth,
+          });
+          status = res.statusCode || 0;
+        }
         if (status >= 200 && status < 300) {
           const ct = String(res.headers['content-type'] || '').toLowerCase();
           // Some IPTV servers return 200 OK with a soft-block HTML page for browser User-Agents,
@@ -1757,14 +1773,21 @@ async function startServer() {
       return;
     }
 
-    // Wait briefly (up to 600ms) in case /api/proxy or /api/transcode is currently opening the stream
-    for (let i = 0; i < 4; i++) {
-      await new Promise((r) => setTimeout(r, 150));
+    // Wait up to 2400ms in case /api/proxy or /api/transcode is currently opening the stream and parsing duration
+    for (let i = 0; i < 12; i++) {
+      await new Promise((r) => setTimeout(r, 200));
       const c = getCachedStreamInfo(rawTargetUrl);
       if (c?.duration && c.duration > 0) {
         res.json({ duration: c.duration });
         return;
       }
+    }
+
+    // If /api/proxy or /api/transcode already cached the stream (meaning playback is active),
+    // do NOT open a competing upstream connection or second FFmpeg process on 1-connection-limit VOD servers!
+    if (getCachedStreamInfo(rawTargetUrl)) {
+      res.json({ duration: getCachedStreamInfo(rawTargetUrl)?.duration || null });
+      return;
     }
 
     try {
@@ -1773,11 +1796,6 @@ async function startServer() {
         range: 'bytes=0-65535',
       });
       const finalUrl = upstream.finalUrl;
-      const usedUa = upstream.usedUa || authOpts.customUa || DEFAULT_BROWSER_UA;
-      const usedRef = upstream.usedReferer || authOpts.customReferer;
-      const cookies = upstream.cookieHeader;
-      const usedMac = upstream.macAddress || authOpts.customMac;
-      const usedAuth = upstream.authHeader || authOpts.customAuth;
 
       // Read up to 64KB to check MP4 mvhd atom or HLS #EXTINF tags without spawning a process
       const chunks: Buffer[] = [];
@@ -1823,67 +1841,7 @@ async function startServer() {
         }
       }
 
-      // 2. Fallback: Use FFMPEG_BIN against 127.0.0.1 loopback proxy (avoids ffprobe missing in prod & avoids DNS SIGSEGV)
-      const localProxyUrl = buildLocalProxyUrl(
-        finalUrl,
-        usedUa,
-        usedRef,
-        cookies,
-        usedMac,
-        usedAuth
-      );
-      const args: string[] = [
-        '-hide_banner',
-        '-probesize',
-        '5000000',
-        '-analyzeduration',
-        '5000000',
-        '-i',
-        localProxyUrl,
-      ];
-
-      const proc = spawn(FFMPEG_BIN, args);
-      let stderrOut = '';
-      let responded = false;
-      const finish = (dur: number | null) => {
-        if (responded) return;
-        responded = true;
-        clearTimeout(t);
-        if (dur && dur > 0) {
-          updateCachedStreamInfo(rawTargetUrl, { duration: dur, finalUrl });
-        }
-        res.json({ duration: dur });
-      };
-
-      const t = setTimeout(() => {
-        try {
-          proc.kill('SIGKILL');
-        } catch {
-          // ignore
-        }
-        finish(parseFfmpegDurationFromStderr(stderrOut));
-      }, 7500);
-
-      proc.stderr.on('data', (d) => {
-        stderrOut += String(d);
-        const found = parseFfmpegDurationFromStderr(stderrOut);
-        if (found && found > 0) {
-          try {
-            proc.kill('SIGKILL');
-          } catch {
-            // ignore
-          }
-          finish(found);
-        }
-      });
-
-      proc.on('close', () => {
-        finish(parseFfmpegDurationFromStderr(stderrOut));
-      });
-
-      proc.on('error', () => {
-        finish(null);
-      });
+      res.json({ duration: null });
     } catch {
       res.json({ duration: null });
     }
@@ -1894,9 +1852,23 @@ async function startServer() {
   //    Cookie/MAC/Xtream Auth Preservation, HTML Wrapper Extraction, and Range Streaming
   // ===========================================================================
   app.get('/api/proxy', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    res.setHeader(
+      'Access-Control-Expose-Headers',
+      'Content-Length, Content-Range, Accept-Ranges, Content-Type'
+    );
+
     const rawTargetUrl = String(req.query.url || '').trim();
     const authOpts = extractRequestAuthOptions(req);
     const { customUa, customReferer, customCookie, customMac, customAuth } = authOpts;
+
+    const reqOrigin = String(req.headers.origin || '');
+    const reqHost = String(req.get('host') || '');
+    const reqProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const proxyOriginPrefix =
+      reqOrigin && reqHost && !reqOrigin.includes(reqHost) ? `${reqProto}://${reqHost}` : '';
 
     if (!rawTargetUrl) {
       res.status(400).send('Missing target URL');
@@ -1918,13 +1890,6 @@ async function startServer() {
 
       const contentType = String(upstream.headers['content-type'] || '');
       const finalUrl = upstream.finalUrl;
-
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Headers', '*');
-      res.setHeader(
-        'Access-Control-Expose-Headers',
-        'Content-Length, Content-Range, Accept-Ranges, Content-Type'
-      );
 
       // Peek at the first chunk to inspect magic bytes (#EXTM3U vs HTML vs binary video)
       const { firstChunk, stream } = await peekFirstChunk(upstream.res);
@@ -1979,7 +1944,7 @@ async function startServer() {
           ) {
             resolved.search = baseUrl.search;
           }
-          return `/api/proxy?url=${encodeURIComponent(
+          return `${proxyOriginPrefix}/api/proxy?url=${encodeURIComponent(
             resolved.toString()
           )}${uaParam}${refParam}${cookieParam}${macParam}${authParam}`;
         };
@@ -2037,6 +2002,30 @@ async function startServer() {
           return;
         }
 
+        // Check if HTML page is a Google Drive large-file confirmation form with hidden <input> params
+        const gdriveFormMatch = htmlText.match(
+          /<form[^>]+action=["'](https:\/\/drive\.usercontent\.google\.com\/download[^"']*)["'][^>]*>([\s\S]*?)<\/form>/i
+        );
+        if (gdriveFormMatch) {
+          const actionBase = gdriveFormMatch[1].replace(/&amp;/g, '&');
+          const formBody = gdriveFormMatch[2];
+          const gUrl = new URL(actionBase);
+          const inputRegex = /<input[^>]+name=["']([^"']+)["'][^>]+value=["']([^"']*)["']/gi;
+          let inpMatch: RegExpExecArray | null;
+          while ((inpMatch = inputRegex.exec(formBody)) !== null) {
+            gUrl.searchParams.set(inpMatch[1], inpMatch[2]);
+          }
+          res.redirect(
+            302,
+            `${proxyOriginPrefix}/api/proxy?url=${encodeURIComponent(gUrl.toString())}${
+              customUa ? `&ua=${encodeURIComponent(customUa)}` : ''
+            }${customReferer ? `&ref=${encodeURIComponent(customReferer)}` : ''}${
+              customMac ? `&mac=${encodeURIComponent(customMac)}` : ''
+            }${customAuth ? `&auth=${encodeURIComponent(customAuth)}` : ''}`
+          );
+          return;
+        }
+
         // Check if HTML page has an embedded direct media link (<source src="..."> or direct .mp4/.mkv/.m3u8 URL)
         const embeddedMediaMatch =
           htmlText.match(
@@ -2050,7 +2039,7 @@ async function startServer() {
           const extractedMediaUrl = embeddedMediaMatch[1].replace(/&amp;/g, '&');
           res.redirect(
             302,
-            `/api/proxy?url=${encodeURIComponent(extractedMediaUrl)}${
+            `${proxyOriginPrefix}/api/proxy?url=${encodeURIComponent(extractedMediaUrl)}${
               customUa ? `&ua=${encodeURIComponent(customUa)}` : ''
             }${customReferer ? `&ref=${encodeURIComponent(customReferer)}` : ''}${
               customMac ? `&mac=${encodeURIComponent(customMac)}` : ''
@@ -2172,6 +2161,9 @@ async function startServer() {
   //    and non-faststart MP4 into browser-native fragmented MP4 (H.264 + AAC)
   // ===========================================================================
   app.get('/api/transcode', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
     const rawTargetUrl = String(req.query.url || '').trim();
     const authOpts = extractRequestAuthOptions(req);
     const { customUa, customReferer, customCookie, customMac, customAuth } = authOpts;
