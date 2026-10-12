@@ -389,17 +389,30 @@ export async function resolveClientSideVodUrls(
         const videoFiles = files.filter(
           (f) => f.name && /\.(mp4|mkv|webm|mov|m4v|avi|ogg)$/i.test(f.name)
         );
-        // Prefer browser-native MP4/WebM first, then MKV/others
+        // Prefer browser-native H.264 MP4/WebM first (avoids HEVC/MPEG-4 Part 2 audio-only black screen on GitHub Pages)
         videoFiles.sort((a, b) => {
-          const aMp4 = /\.(mp4|webm|m4v|mov)$/i.test(a.name || '') ? 0 : 1;
-          const bMp4 = /\.(mp4|webm|m4v|mov)$/i.test(b.name || '') ? 0 : 1;
-          return aMp4 - bMp4;
+          const aFmt = (a.format || '').toLowerCase();
+          const bFmt = (b.format || '').toLowerCase();
+          const aH264 = aFmt.includes('h.264') || aFmt.includes('mpeg4') ? 0 : 1;
+          const bH264 = bFmt.includes('h.264') || bFmt.includes('mpeg4') ? 0 : 1;
+          const aMp4 = /\.(mp4|webm|m4v)$/i.test(a.name || '') ? 0 : 1;
+          const bMp4 = /\.(mp4|webm|m4v)$/i.test(b.name || '') ? 0 : 1;
+          if (aMp4 !== bMp4) return aMp4 - bMp4;
+          return aH264 - bH264;
         });
 
         const cleanTitle = (channel.name || '').trim().toLowerCase();
         const cleanSub = subPath.toLowerCase();
+        const cleanSubBase = cleanSub.replace(/\.[a-z0-9]{2,5}$/i, '');
 
         const matchedList = [
+          // If the original subPath was an .mkv/.avi, prioritize a matching .mp4 derivative first so video renders in browser!
+          ...videoFiles.filter(
+            (f) =>
+              cleanSubBase &&
+              /\.(mp4|webm|m4v)$/i.test(f.name || '') &&
+              f.name!.toLowerCase().replace(/\.[a-z0-9]{2,5}$/i, '') === cleanSubBase
+          ),
           ...videoFiles.filter((f) => cleanSub && f.name!.toLowerCase() === cleanSub),
           ...videoFiles.filter((f) => cleanSub && f.name!.toLowerCase().startsWith(cleanSub)),
           ...videoFiles.filter(

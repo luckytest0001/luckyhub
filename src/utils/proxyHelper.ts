@@ -1,7 +1,7 @@
 /**
  * Smart Proxy & Backend Resolution Helper
  * Ensures the IPTV Web App works seamlessly both when deployed on full-stack Node/Cloud Run
- * AND when deployed as a static site on GitHub Pages (*.github.io), Vercel, Netlify, etc.
+ * AND when deployed as a static site on GitHub Pages (*.github.io), Vercel, Netlify, or custom domains.
  */
 
 const REMOTE_BACKEND_FALLBACK_URLS = [
@@ -13,13 +13,39 @@ const REMOTE_BACKEND_FALLBACK_URLS = [
 let resolvedApiBaseUrl: string | null = null;
 let backendAvailable = false;
 let probePromise: Promise<string | null> | null = null;
+let probeFinished = false;
 
 /**
- * Detects if the current hostname is a known static-only hosting provider (like GitHub Pages)
- * where relative `/api/*` routes do not exist and would return 404 HTML pages.
+ * Reads any user-configured proxy host from localStorage (`iptv_proxy_settings_v1`)
+ * if it looks like a full HTTP/HTTPS backend URL.
+ */
+function getCustomConfiguredBackendUrl(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem('iptv_proxy_settings_v1');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { enabled?: boolean; host?: string; port?: string };
+    if (parsed?.enabled && parsed.host) {
+      const h = parsed.host.trim();
+      if (/^https?:\/\//i.test(h)) {
+        return h.replace(/\/+$/, '');
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * Detects if the current environment is a static-only host (like GitHub Pages, Vercel, Netlify,
+ * or any host where `/api/probe` was checked and found not to be our Express server).
  */
 export function isStaticHostEnvironment(): boolean {
   if (typeof window === 'undefined') return false;
+  if (probeFinished && !backendAvailable) {
+    return true;
+  }
   const host = window.location.hostname.toLowerCase();
   const proto = window.location.protocol.toLowerCase();
   if (proto === 'file:' || proto === 'capacitor:' || proto === 'ionic:') {
@@ -27,17 +53,23 @@ export function isStaticHostEnvironment(): boolean {
   }
   return (
     host.endsWith('.github.io') ||
+    host.endsWith('.githubusercontent.com') ||
     host.endsWith('.pages.dev') ||
     host.endsWith('.netlify.app') ||
     host.endsWith('.vercel.app') ||
     host.endsWith('.surge.sh') ||
     host.endsWith('.gitlab.io') ||
     host.endsWith('.firebaseapp.com') ||
-    host.endsWith('.web.app')
+    host.endsWith('.web.app') ||
+    host.endsWith('.render.com') ||
+    host.endsWith('.onrender.com') ||
+    host.endsWith('.fly.dev') ||
+    host.endsWith('.railway.app') ||
+    host.endsWith('.cloudflarepages.com')
   );
 }
 
-async function checkBackendUrl(baseUrl: string, timeoutMs = 3500): Promise<boolean> {
+async function checkBackendUrl(baseUrl: string, timeoutMs = 2400): Promise<boolean> {
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -46,9 +78,11 @@ async function checkBackendUrl(baseUrl: string, timeoutMs = 3500): Promise<boole
     const res = await fetch(testUrl, {
       method: 'GET',
       signal: controller.signal,
+      cache: 'no-store',
     });
     if (!res.ok) return false;
     const ct = (res.headers.get('content-type') || '').toLowerCase();
+    // Static hosts (GitHub Pages / SPA hosts) return text/html for unknown routes
     if (!ct.includes('application/json')) return false;
     const data = await res.json();
     return data !== null && typeof data === 'object' && 'duration' in data;
@@ -64,7 +98,7 @@ async function checkBackendUrl(baseUrl: string, timeoutMs = 3500): Promise<boole
  * or remote Cloud Run URL when hosted on GitHub Pages, or `null` if no backend is reachable).
  */
 export async function ensureBackendProbed(): Promise<string | null> {
-  if (resolvedApiBaseUrl !== null || backendAvailable) {
+  if (probeFinished) {
     return resolvedApiBaseUrl;
   }
   if (probePromise) {
@@ -73,12 +107,16 @@ export async function ensureBackendProbed(): Promise<string | null> {
 
   probePromise = (async () => {
     const candidates: string[] = [];
+    const customBackend = getCustomConfiguredBackendUrl();
+    if (customBackend) {
+      candidates.push(customBackend);
+    }
     if (!isStaticHostEnvironment()) {
       candidates.push('');
     }
     for (const remote of REMOTE_BACKEND_FALLBACK_URLS) {
       const cleaned = remote.replace(/\/+$/, '');
-      if (!candidates.includes(cleaned)) {
+      if (cleaned && !candidates.includes(cleaned)) {
         candidates.push(cleaned);
       }
     }
@@ -88,12 +126,14 @@ export async function ensureBackendProbed(): Promise<string | null> {
       if (ok) {
         resolvedApiBaseUrl = candidate;
         backendAvailable = true;
+        probeFinished = true;
         return candidate;
       }
     }
 
     backendAvailable = false;
     resolvedApiBaseUrl = null;
+    probeFinished = true;
     return null;
   })();
 
@@ -113,6 +153,10 @@ export function getEffectiveApiBaseUrl(): string {
   if (resolvedApiBaseUrl !== null) {
     return resolvedApiBaseUrl;
   }
+  const customBackend = getCustomConfiguredBackendUrl();
+  if (customBackend) {
+    return customBackend;
+  }
   if (isStaticHostEnvironment()) {
     return REMOTE_BACKEND_FALLBACK_URLS[0] || '';
   }
@@ -120,29 +164,67 @@ export function getEffectiveApiBaseUrl(): string {
 }
 
 /**
- * Returns whether the backend proxy/transcode server has been verified available,
- * or is expected to be available (when not yet finished probing).
+ * Returns whether the backend proxy/transcode server has been verified available.
+ * Never returns true on static hosts unless a remote backend explicitly passed the health check.
  */
 export function canUseBackendProxy(): boolean {
   if (backendAvailable) return true;
-  // If probe hasn't finished yet and we're not on a static host without fallbacks, allow trying
-  if (probePromise !== null && resolvedApiBaseUrl === null) {
-    return !isStaticHostEnvironment() || REMOTE_BACKEND_FALLBACK_URLS.length > 0;
-  }
-  return false;
+  if (probeFinished) return false;
+  return !isStaticHostEnvironment();
 }
 
 /**
- * Builds public CORS proxy URLs for fetching text/M3U/HLS manifests directly from the browser
- * when deployed on GitHub Pages or when backend proxy is unavailable.
+ * Builds public CORS & HTTPS-bridge proxy URLs for fetching or streaming media/M3U/HLS/VOD
+ * directly from the browser when deployed on GitHub Pages (HTTPS) or when backend proxy is unavailable.
  */
 export function buildPublicCorsProxyUrls(targetUrl: string): string[] {
   if (!/^https?:\/\//i.test(targetUrl)) return [];
   return [
     `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
     `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
   ];
+}
+
+/**
+ * Given any media URL (HTTP or HTTPS), returns an ordered list of browser-safe URLs
+ * that will not be blocked by Mixed Content on HTTPS GitHub Pages deployments.
+ */
+export function getHttpsSafeMediaUrls(rawUrl: string): string[] {
+  if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) return [];
+  const urls: string[] = [];
+  const pushUnique = (u?: string) => {
+    if (u && !urls.includes(u)) urls.push(u);
+  };
+
+  const isPageHttps =
+    typeof window !== 'undefined' && window.location.protocol === 'https:';
+  const isTargetHttp = /^http:\/\//i.test(rawUrl);
+
+  if (!isPageHttps || !isTargetHttp) {
+    // Already HTTPS (or page is HTTP): try direct URL first, then CORS proxy URLs
+    pushUnique(rawUrl);
+    for (const corsUrl of buildPublicCorsProxyUrls(rawUrl)) {
+      pushUnique(corsUrl);
+    }
+    return urls;
+  }
+
+  // Page is HTTPS (e.g. GitHub Pages) and target media URL is plain http://
+  // 1. If target uses default port 80 (no explicit :8080/:25461), try direct https:// upgrade first
+  if (/^http:\/\/[^/:]+(\/|$)/i.test(rawUrl)) {
+    pushUnique(rawUrl.replace(/^http:\/\//i, 'https://'));
+  }
+
+  // 2. Bridge plain http:// VOD/stream over HTTPS via public CORS proxies (supports Range & binary streaming)
+  for (const corsUrl of buildPublicCorsProxyUrls(rawUrl)) {
+    pushUnique(corsUrl);
+  }
+
+  // 3. Keep rawUrl last in case browser allows mixed content or user enabled insecure content for site
+  pushUnique(rawUrl);
+
+  return urls;
 }
 
 /**
@@ -157,8 +239,8 @@ export async function fetchWithUniversalFallback(
 ): Promise<Response> {
   const baseUrl = await ensureBackendProbed();
 
-  // 1. If we are on a static host (like GitHub Pages), try Direct Fetch first for fast CORS-friendly URLs
-  if (isStaticHostEnvironment()) {
+  // 1. If we are on a static host (like GitHub Pages), try Direct Fetch first for fast CORS-friendly HTTPS URLs
+  if (isStaticHostEnvironment() && /^https:\/\//i.test(targetUrl)) {
     try {
       const directRes = await fetch(targetUrl);
       if (directRes.ok) return directRes;
@@ -195,7 +277,7 @@ export async function fetchWithUniversalFallback(
     }
   }
 
-  // 4. Try Public CORS Proxies (ensures GitHub Pages can load any M3U/Xtream/VOD URL)
+  // 4. Try Public CORS Proxies (ensures GitHub Pages can load any HTTP/HTTPS M3U/Xtream/VOD URL)
   const corsUrls = buildPublicCorsProxyUrls(targetUrl);
   for (const corsUrl of corsUrls) {
     try {

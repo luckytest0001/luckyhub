@@ -21,6 +21,7 @@ import {
   canUseBackendProxy,
   ensureBackendProbed,
   getEffectiveApiBaseUrl,
+  getHttpsSafeMediaUrls,
   isStaticHostEnvironment,
 } from '../utils/proxyHelper';
 
@@ -443,6 +444,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     };
 
     const corsProxyUrls = buildPublicCorsProxyUrls(cleanUrl);
+    const httpsSafeCleanUrls = getHttpsSafeMediaUrls(cleanUrl);
 
     if (!isHttpProtocol) {
       // RTMP / RTSP / UDP / MMS streams handled via server-side FFmpeg H.264 transcode
@@ -450,141 +452,167 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     } else if (isExplicitM3u8) {
       // 1. Try Direct Browser HLS first if HTTPS (or on static deploy like GitHub Pages) & no MAC auth
       if ((!mustUseProxyOnly || isStaticDeploy) && Hls.isSupported()) {
-        if (isHttpsUrl || !isPageHttps) {
-          pushAttempt('hls', cleanUrl, true);
-        } else if (httpsUpgradedUrl) {
-          pushAttempt('hls', httpsUpgradedUrl, true);
+        for (const safeUrl of httpsSafeCleanUrls) {
+          pushAttempt('hls', safeUrl, true);
         }
       }
       // 2. Backend Proxy HLS
       if (Hls.isSupported()) {
         pushAttempt('hls', proxyUrl);
-        if (isStaticDeploy && corsProxyUrls[0]) {
-          pushAttempt('hls', corsProxyUrls[0], true);
+        for (const safeUrl of httpsSafeCleanUrls) {
+          pushAttempt('hls', safeUrl, true);
         }
-        // Always include direct cleanUrl as fallback even if mustUseProxyOnly was true
-        pushAttempt('hls', cleanUrl, true);
       }
       // 3. If Xtream Codes live stream, also try the authenticated .ts endpoint
       if (xtreamTsProxyUrl && mpegts.isSupported()) {
         pushAttempt('mpegts', xtreamTsProxyUrl);
       }
       if (xtreamAltUrls.tsUrl && mpegts.isSupported()) {
-        pushAttempt('mpegts', xtreamAltUrls.tsUrl, true);
+        for (const safeTsUrl of getHttpsSafeMediaUrls(xtreamAltUrls.tsUrl)) {
+          pushAttempt('mpegts', safeTsUrl, true);
+        }
       }
       // 4. Native HLS fallback (Safari / iOS / Android WebView native HLS)
       if (!mustUseProxyOnly || isStaticDeploy) {
-        pushAttempt('native', cleanUrl, true);
+        for (const safeUrl of httpsSafeCleanUrls) {
+          pushAttempt('native', safeUrl, true);
+        }
       }
       pushAttempt('native', proxyUrl);
       pushAttempt('native', cleanUrl, true);
       pushAttempt('native', transcodeFullUrl);
     } else if (isExplicitTsOrFlv) {
       if (mpegts.isSupported()) {
-        if (isStaticDeploy && (isHttpsUrl || !isPageHttps)) {
-          pushAttempt('mpegts', cleanUrl, true);
+        if (isStaticDeploy) {
+          for (const safeUrl of httpsSafeCleanUrls) {
+            pushAttempt('mpegts', safeUrl, true);
+          }
         }
         pushAttempt('mpegts', proxyUrl);
-        pushAttempt('mpegts', cleanUrl, true);
+        for (const safeUrl of httpsSafeCleanUrls) {
+          pushAttempt('mpegts', safeUrl, true);
+        }
       }
       if (Hls.isSupported()) {
         if (xtreamHlsProxyUrl) {
           pushAttempt('hls', xtreamHlsProxyUrl);
         }
         if (xtreamAltUrls.hlsUrl) {
-          pushAttempt('hls', xtreamAltUrls.hlsUrl, true);
+          for (const safeHlsUrl of getHttpsSafeMediaUrls(xtreamAltUrls.hlsUrl)) {
+            pushAttempt('hls', safeHlsUrl, true);
+          }
         }
         pushAttempt('hls', proxyUrl);
       }
       pushAttempt('native', transcodeFullUrl);
-      pushAttempt('native', cleanUrl, true);
+      for (const safeUrl of httpsSafeCleanUrls) {
+        pushAttempt('native', safeUrl, true);
+      }
     } else if (isMkvAviOrLegacyContainer) {
       // On GitHub Pages / static hosts (or for HTTPS MKVs where browser plays Matroska natively),
-      // include direct playback and MP4 Xtream variants alongside proxy & transcode!
+      // include MP4 Xtream variants and HTTPS-bridged direct playback so video & audio both work!
       if (isStaticDeploy) {
         if (xtreamAltUrls.vodMp4Url) {
-          pushAttempt('native', xtreamAltUrls.vodMp4Url, true);
+          for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url)) {
+            pushAttempt('native', safeMp4, true);
+          }
         }
-        if (isHttpsUrl || !isPageHttps) {
-          pushAttempt('native', cleanUrl, true);
-        } else if (httpsUpgradedUrl) {
-          pushAttempt('native', httpsUpgradedUrl, true);
+        for (const safeUrl of httpsSafeCleanUrls) {
+          pushAttempt('native', safeUrl, true);
         }
       }
       pushAttempt('native', transcodeFullUrl);
       pushAttempt('native', proxyUrl);
       if (xtreamAltUrls.vodMp4Url) {
         pushAttempt('native', buildProxyUrl(normalizedChannel, userAgent, xtreamAltUrls.vodMp4Url));
-        pushAttempt('native', xtreamAltUrls.vodMp4Url, true);
+        for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url)) {
+          pushAttempt('native', safeMp4, true);
+        }
       }
-      if (httpsUpgradedUrl) {
-        pushAttempt('native', httpsUpgradedUrl, true);
+      for (const safeUrl of httpsSafeCleanUrls) {
+        pushAttempt('native', safeUrl, true);
       }
-      pushAttempt('native', cleanUrl, true);
     } else if (isExplicitNativeVod) {
       // Standard VOD (.mp4, .webm, .mov, /movie/, /series/, /vod/, Archive.org, Google Drive, Dropbox, Pixeldrain):
-      // Prioritize Direct Browser playback when HTTPS or on GitHub Pages so IP-locked & CDN VODs play immediately without proxy errors!
+      // Prioritize HTTPS-safe Direct & CORS-bridged playback so both https:// and http:// VODs play on GitHub Pages!
       if ((isHttpsUrl || !isPageHttps || isStaticDeploy) && !hasMacAuth) {
-        if (isHttpsUrl || !isPageHttps) {
-          pushAttempt('native', cleanUrl, true);
-        } else if (httpsUpgradedUrl) {
-          pushAttempt('native', httpsUpgradedUrl, true);
+        for (const safeUrl of httpsSafeCleanUrls) {
+          pushAttempt('native', safeUrl, true);
         }
       }
       pushAttempt('native', proxyUrl);
-      if (httpsUpgradedUrl) {
-        pushAttempt('native', httpsUpgradedUrl, true);
+      for (const safeUrl of httpsSafeCleanUrls) {
+        pushAttempt('native', safeUrl, true);
       }
-      pushAttempt('native', cleanUrl, true);
       if (xtreamAltUrls.vodMp4Url && xtreamAltUrls.vodMp4Url !== cleanUrl) {
-        pushAttempt('native', xtreamAltUrls.vodMp4Url, true);
+        for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url)) {
+          pushAttempt('native', safeMp4, true);
+        }
         pushAttempt('native', buildProxyUrl(normalizedChannel, userAgent, xtreamAltUrls.vodMp4Url));
       }
       if (xtreamAltUrls.vodMkvUrl && xtreamAltUrls.vodMkvUrl !== cleanUrl) {
         pushAttempt('native', buildProxyUrl(normalizedChannel, userAgent, xtreamAltUrls.vodMkvUrl));
-        pushAttempt('native', xtreamAltUrls.vodMkvUrl, true);
+        for (const safeMkv of getHttpsSafeMediaUrls(xtreamAltUrls.vodMkvUrl)) {
+          pushAttempt('native', safeMkv, true);
+        }
       }
       pushAttempt('native', transcodeFullUrl);
       if (Hls.isSupported()) {
         pushAttempt('hls', proxyUrl);
-        pushAttempt('hls', cleanUrl, true);
+        for (const safeUrl of httpsSafeCleanUrls) {
+          pushAttempt('hls', safeUrl, true);
+        }
       }
     } else {
       // Extensionless live IPTV URLs (e.g. Xtream Codes /live/user/pass/123, /user/pass/123, Stalker play/live.php?mac=...)
       if (normalizedChannel.xtreamParams?.streamType === 'live') {
-        if (mpegts.isSupported()) {
-          pushAttempt('mpegts', xtreamTsProxyUrl || proxyUrl);
-          if (xtreamAltUrls.tsUrl) {
-            pushAttempt('mpegts', xtreamAltUrls.tsUrl, true);
-          }
-        }
         if (Hls.isSupported()) {
+          if (isStaticDeploy && xtreamAltUrls.hlsUrl) {
+            for (const safeHls of getHttpsSafeMediaUrls(xtreamAltUrls.hlsUrl)) {
+              pushAttempt('hls', safeHls, true);
+            }
+          }
           if (xtreamHlsProxyUrl) {
             pushAttempt('hls', xtreamHlsProxyUrl);
           }
           if (xtreamAltUrls.hlsUrl) {
-            pushAttempt('hls', xtreamAltUrls.hlsUrl, true);
+            for (const safeHls of getHttpsSafeMediaUrls(xtreamAltUrls.hlsUrl)) {
+              pushAttempt('hls', safeHls, true);
+            }
           }
           pushAttempt('hls', proxyUrl);
+        }
+        if (mpegts.isSupported()) {
+          pushAttempt('mpegts', xtreamTsProxyUrl || proxyUrl);
+          if (xtreamAltUrls.tsUrl) {
+            for (const safeTs of getHttpsSafeMediaUrls(xtreamAltUrls.tsUrl)) {
+              pushAttempt('mpegts', safeTs, true);
+            }
+          }
         }
       } else {
         if (Hls.isSupported()) {
           if (!mustUseProxyOnly || isStaticDeploy) {
-            pushAttempt('hls', cleanUrl, true);
+            for (const safeUrl of httpsSafeCleanUrls) {
+              pushAttempt('hls', safeUrl, true);
+            }
           }
           pushAttempt('hls', proxyUrl);
-          if (isStaticDeploy && corsProxyUrls[0]) {
-            pushAttempt('hls', corsProxyUrls[0], true);
+          for (const safeUrl of httpsSafeCleanUrls) {
+            pushAttempt('hls', safeUrl, true);
           }
-          pushAttempt('hls', cleanUrl, true);
         }
         if (mpegts.isSupported()) {
           pushAttempt('mpegts', proxyUrl);
-          pushAttempt('mpegts', cleanUrl, true);
+          for (const safeUrl of httpsSafeCleanUrls) {
+            pushAttempt('mpegts', safeUrl, true);
+          }
         }
       }
       pushAttempt('native', proxyUrl);
-      pushAttempt('native', cleanUrl, true);
+      for (const safeUrl of httpsSafeCleanUrls) {
+        pushAttempt('native', safeUrl, true);
+      }
       pushAttempt('native', transcodeFullUrl);
     }
 
@@ -804,19 +832,49 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
 
           hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
             if (!isMounted || myToken !== attemptToken) return;
-            const hasUnsupportedVideoCodec =
-              Array.isArray(data?.levels) &&
-              data.levels.length > 0 &&
-              data.levels.every(
-                (lvl: { videoCodec?: string; attrs?: { CODECS?: string } }) => {
-                  const codecs = `${lvl.videoCodec || ''} ${lvl.attrs?.CODECS || ''}`.toLowerCase();
-                  return /hev1|hvc1|hevc|mp4v|mpeg2/i.test(codecs);
-                }
-              );
-            if (hasUnsupportedVideoCodec) {
+            const levels = Array.isArray(data?.levels) ? data.levels : [];
+            const isLevelUnsupportedOrAudioOnly = (lvl: {
+              videoCodec?: string;
+              width?: number;
+              height?: number;
+              attrs?: { CODECS?: string; RESOLUTION?: string };
+            }) => {
+              const codecs = `${lvl.videoCodec || ''} ${lvl.attrs?.CODECS || ''}`.toLowerCase();
+              if (/hev1|hvc1|hevc|mp4v|mpeg2/i.test(codecs)) return true;
+              // Detect audio-only variant streams (e.g. mp4a.40.2 with no avc1/vp9/av01 and no resolution)
+              const hasAudioCodec = /mp4a|aac|ac-3|ec-3|opus|vorbis|mp3/i.test(codecs);
+              const hasVideoCodec = /avc1|vp09|vp9|av01|theora/i.test(codecs);
+              const hasDimensions =
+                (lvl.width && lvl.width > 0) ||
+                (lvl.height && lvl.height > 0) ||
+                Boolean(lvl.attrs?.RESOLUTION);
+              if (hasAudioCodec && !hasVideoCodec && !hasDimensions && levels.length > 1) {
+                return true;
+              }
+              return false;
+            };
+
+            if (levels.length > 0 && levels.every(isLevelUnsupportedOrAudioOnly)) {
               jumpToTranscodeOrNext(myToken);
               return;
             }
+
+            // If some levels are H.264/AVC and others are HEVC or audio-only, lock to the best H.264 video level
+            // so the browser never shows a black screen with audio only!
+            if (hls && levels.length > 1 && levels.some(isLevelUnsupportedOrAudioOnly)) {
+              const supportedIndices: number[] = [];
+              levels.forEach((lvl, idx) => {
+                if (!isLevelUnsupportedOrAudioOnly(lvl)) {
+                  supportedIndices.push(idx);
+                }
+              });
+              if (supportedIndices.length > 0) {
+                const bestSupportedIdx = supportedIndices[supportedIndices.length - 1];
+                hls.currentLevel = bestSupportedIdx;
+                hls.loadLevel = bestSupportedIdx;
+              }
+            }
+
             if (pendingInitialSeekSec > 0) {
               try {
                 video.currentTime = pendingInitialSeekSec;
@@ -1058,23 +1116,35 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
           setIsPlaying(true);
         }
 
-        // If a native or streaming container plays audio for 5.5s with 0x0 video dimensions (e.g. HEVC in MP4/TS),
-        // switch to FFmpeg H.264 transcode.
+        // If a native or streaming container plays audio for 3.2s with 0x0 video dimensions (e.g. HEVC/MPEG-2 in MP4/MKV/TS),
+        // switch to an H.264 level, next MP4 variant, or FFmpeg H.264 transcode so video is never missing!
         if (!hasVideoDimensions && !isTranscodeAttempt && noVideoTimer === null) {
           const tokenAtStart = attemptToken;
           noVideoTimer = window.setTimeout(() => {
             noVideoTimer = null;
             if (!isMounted || isTransitioning || tokenAtStart !== attemptToken) return;
-            if ((video.videoWidth === 0 || video.videoHeight === 0) && video.currentTime > 1.5) {
+            if ((video.videoWidth === 0 || video.videoHeight === 0) && video.currentTime > 0.8) {
+              if (activeAttempt?.mode === 'hls' && hls && hls.levels && hls.levels.length > 1) {
+                const altLevelIdx = hls.levels.findIndex(
+                  (lvl, idx) =>
+                    idx !== hls?.currentLevel &&
+                    ((lvl.width && lvl.width > 0) ||
+                      /avc1/i.test(`${lvl.videoCodec || ''} ${lvl.attrs?.CODECS || ''}`))
+                );
+                if (altLevelIdx !== -1) {
+                  hls.currentLevel = altLevelIdx;
+                  return;
+                }
+              }
               jumpToTranscodeOrNext(tokenAtStart);
             }
-          }, 5500);
+          }, 3200);
         }
         return;
       }
 
       // Audio/metadata started on a native non-transcode attempt, but videoWidth is still 0.
-      // Wait up to 4500ms for video dimensions; if still 0, switch to FFmpeg H.264 transcoding.
+      // Wait up to 2800ms for video dimensions; if still 0, switch to next MP4 variant or FFmpeg H.264 transcoding.
       if (noVideoTimer === null) {
         const tokenAtStart = attemptToken;
         noVideoTimer = window.setTimeout(() => {
@@ -1085,7 +1155,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
           } else {
             confirmOrWatchVideoTrack();
           }
-        }, 4500);
+        }, 2800);
       }
     };
 
@@ -1365,11 +1435,20 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         for (let i = resolvedUrls.length - 1; i >= 0; i--) {
           const rUrl = resolvedUrls[i];
           if (rUrl && rUrl !== cleanUrl) {
-            attempts.unshift({
-              mode: 'native',
-              url: buildProxyUrl(normalizedChannel, userAgent, rUrl, resolvedBase),
-            });
-            attempts.unshift({ mode: 'native', url: rUrl, isDirect: true });
+            if (canUseBackendProxy()) {
+              attempts.unshift({
+                mode: 'native',
+                url: buildProxyUrl(normalizedChannel, userAgent, rUrl, resolvedBase),
+              });
+            }
+            const safeResolvedList = getHttpsSafeMediaUrls(rUrl);
+            for (let j = safeResolvedList.length - 1; j >= 0; j--) {
+              attempts.unshift({
+                mode: 'native',
+                url: safeResolvedList[j],
+                isDirect: true,
+              });
+            }
           }
         }
       }
