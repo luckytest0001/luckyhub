@@ -189,8 +189,10 @@ export function buildPublicCorsProxyUrls(targetUrl: string): string[] {
 /**
  * Given any media URL (HTTP or HTTPS), returns an ordered list of browser-safe URLs
  * that will not be blocked by Mixed Content on HTTPS GitHub Pages deployments.
+ * When `forNativeVideo` is true, avoids text-only CORS proxies (codetabs/allorigins)
+ * that strip HTTP `Range` headers and break VOD seeking.
  */
-export function getHttpsSafeMediaUrls(rawUrl: string): string[] {
+export function getHttpsSafeMediaUrls(rawUrl: string, forNativeVideo = false): string[] {
   if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) return [];
   const urls: string[] = [];
   const pushUnique = (u?: string) => {
@@ -202,26 +204,32 @@ export function getHttpsSafeMediaUrls(rawUrl: string): string[] {
   const isTargetHttp = /^http:\/\//i.test(rawUrl);
 
   if (!isPageHttps || !isTargetHttp) {
-    // Already HTTPS (or page is HTTP): try direct URL first, then CORS proxy URLs
+    // Already HTTPS (or page is HTTP): <video> does not require CORS for native media playback
     pushUnique(rawUrl);
-    for (const corsUrl of buildPublicCorsProxyUrls(rawUrl)) {
-      pushUnique(corsUrl);
+    if (!forNativeVideo) {
+      for (const corsUrl of buildPublicCorsProxyUrls(rawUrl)) {
+        pushUnique(corsUrl);
+      }
     }
     return urls;
   }
 
   // Page is HTTPS (e.g. GitHub Pages) and target media URL is plain http://
-  // 1. If target uses default port 80 (no explicit :8080/:25461), try direct https:// upgrade first
+  // 1. If target uses default port 80 (no explicit :8080/:25461), try direct https:// upgrade first (supports full Range seeking)
   if (/^http:\/\/[^/:]+(\/|$)/i.test(rawUrl)) {
     pushUnique(rawUrl.replace(/^http:\/\//i, 'https://'));
   }
 
-  // 2. Bridge plain http:// VOD/stream over HTTPS via public CORS proxies (supports Range & binary streaming)
-  for (const corsUrl of buildPublicCorsProxyUrls(rawUrl)) {
-    pushUnique(corsUrl);
+  // 2. Bridge plain http:// VOD/stream over HTTPS
+  if (forNativeVideo) {
+    pushUnique(`https://corsproxy.io/?${encodeURIComponent(rawUrl)}`);
+  } else {
+    for (const corsUrl of buildPublicCorsProxyUrls(rawUrl)) {
+      pushUnique(corsUrl);
+    }
   }
 
-  // 3. Keep rawUrl last in case browser allows mixed content or user enabled insecure content for site
+  // 3. Keep rawUrl as fallback in case browser/WebView allows mixed-content passive video or user enabled insecure content
   pushUnique(rawUrl);
 
   return urls;

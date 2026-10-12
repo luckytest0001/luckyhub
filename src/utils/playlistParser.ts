@@ -344,6 +344,145 @@ export function buildAuthenticatedXtreamAltUrls(channel: Channel): {
   };
 }
 
+const clientVodDurationCache = new Map<string, number>();
+
+export function getCachedClientVodDuration(url?: string): number | undefined {
+  if (!url) return undefined;
+  const val = clientVodDurationCache.get(url.split('#')[0]);
+  return val && Number.isFinite(val) && val > 0 ? val : undefined;
+}
+
+function setCachedClientVodDuration(url: string | undefined, durationSec: number | null | undefined) {
+  if (!url || !durationSec || !Number.isFinite(durationSec) || durationSec <= 0) return;
+  clientVodDurationCache.set(url.split('#')[0], durationSec);
+}
+
+function parseArchiveLengthField(rawLen?: string | number): number | null {
+  if (rawLen === undefined || rawLen === null) return null;
+  if (typeof rawLen === 'number') {
+    return Number.isFinite(rawLen) && rawLen > 0 ? rawLen : null;
+  }
+  const s = String(rawLen).trim();
+  if (!s) return null;
+  if (/^\d+(?:\.\d+)?$/.test(s)) {
+    const val = parseFloat(s);
+    return Number.isFinite(val) && val > 0 ? val : null;
+  }
+  const parts = s.split(':').map((p) => parseFloat(p));
+  if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
+    const total = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    return total > 0 ? total : null;
+  }
+  if (parts.length === 2 && parts.every((n) => Number.isFinite(n))) {
+    const total = parts[0] * 60 + parts[1];
+    return total > 0 ? total : null;
+  }
+  return null;
+}
+
+function parseMp4MvhdDurationClient(buf: Uint8Array): number | null {
+  if (!buf || buf.length < 32) return null;
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  // Scan for 'mvhd' (0x6d, 0x76, 0x68, 0x64)
+  for (let i = 4; i <= buf.length - 28; i++) {
+    if (
+      buf[i] === 0x6d &&
+      buf[i + 1] === 0x76 &&
+      buf[i + 2] === 0x68 &&
+      buf[i + 3] === 0x64
+    ) {
+      const version = buf[i + 4];
+      if (version === 0 && i + 24 <= buf.length) {
+        const timescale = view.getUint32(i + 16, false);
+        const duration = view.getUint32(i + 20, false);
+        if (timescale > 0 && duration > 0 && duration !== 0xffffffff) {
+          const secs = duration / timescale;
+          if (secs > 1 && secs < 86400 * 3) return secs;
+        }
+      } else if (version === 1 && i + 36 <= buf.length) {
+        const timescale = view.getUint32(i + 24, false);
+        const high = view.getUint32(i + 28, false);
+        const low = view.getUint32(i + 32, false);
+        const duration = high * 4294967296 + low;
+        if (timescale > 0 && duration > 0) {
+          const secs = duration / timescale;
+          if (secs > 1 && secs < 86400 * 3) return secs;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Probes VOD duration purely from the browser (works on static GitHub Pages without /api/probe)
+ * using cached Archive.org metadata, Xtream get_vod_info API, or HTTP Range bytes=0-131071 MP4 mvhd parsing.
+ */
+export async function probeClientSideVodDuration(
+  channel: Channel,
+  candidateUrls: string[],
+  signal?: AbortSignal
+): Promise<number | null> {
+  const cleanUrl = normalizeVodMediaUrl(channel.url || '');
+  const allUrls = [cleanUrl, ...candidateUrls].filter(Boolean);
+  for (const u of allUrls) {
+    const cached = getCachedClientVodDuration(u);
+    if (cached) return cached;
+  }
+
+  // 1. If Xtream VOD movie, query player_api.php?action=get_vod_info
+  const xp = channel.xtreamParams || parseXtreamAndMacParams(cleanUrl).xtreamParams;
+  if (xp && xp.streamType === 'movie' && xp.server && xp.username && xp.password && xp.streamId) {
+    try {
+      const apiUrl = `${xp.server.replace(/\/+$/, '')}/player_api.php?username=${encodeURIComponent(
+        xp.username
+      )}&password=${encodeURIComponent(xp.password)}&action=get_vod_info&vod_id=${encodeURIComponent(
+        xp.streamId
+      )}`;
+      const res = await fetch(apiUrl, { signal });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          info?: { duration_secs?: number | string; duration?: string };
+        };
+        const durSecs =
+          parseArchiveLengthField(data?.info?.duration_secs) ||
+          parseArchiveLengthField(data?.info?.duration);
+        if (durSecs && durSecs > 0) {
+          for (const u of allUrls) setCachedClientVodDuration(u, durSecs);
+          return durSecs;
+        }
+      }
+    } catch {
+      // ignore and continue
+    }
+  }
+
+  // 2. Try fetching first 128KB with Range header to parse MP4 mvhd box directly in browser
+  for (const target of allUrls.slice(0, 2)) {
+    if (!/^https:\/\//i.test(target) && typeof window !== 'undefined' && window.location.protocol === 'https:') {
+      continue;
+    }
+    try {
+      const res = await fetch(target, {
+        headers: { Range: 'bytes=0-131071' },
+        signal,
+      });
+      if (res.ok || res.status === 206) {
+        const ab = await res.arrayBuffer();
+        const dur = parseMp4MvhdDurationClient(new Uint8Array(ab));
+        if (dur && dur > 0) {
+          for (const u of allUrls) setCachedClientVodDuration(u, dur);
+          return dur;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return null;
+}
+
 /**
  * Resolves Archive.org /details/<id> or truncated /download/<id> URLs, Google Drive alternate
  * download links, and truncated VOD filenames directly in the browser (works 100% client-side
@@ -369,10 +508,10 @@ export async function resolveClientSideVodUrls(
   if (archiveMatch) {
     const itemId = archiveMatch[1];
     const subPath = archiveMatch[2] ? safeDecodeURIComponent(archiveMatch[2]).trim() : '';
-    const hasVideoExt = /\.(mp4|mkv|webm|mov|m4v|avi|ts|flv|ogg)$/i.test(subPath);
+    const isDirectMp4OrWebm = /\.(mp4|webm|m4v)(\?|$)/i.test(subPath);
 
-    // If it already has a full video filename on /download/, include it first
-    if (hasVideoExt && /\/download\//i.test(cleanUrl)) {
+    // Only place cleanUrl before metadata lookup if it is ALREADY a browser-native .mp4/.webm on /download/
+    if (isDirectMp4OrWebm && /\/download\//i.test(cleanUrl)) {
       pushUnique(cleanUrl);
     }
 
@@ -383,13 +522,13 @@ export async function resolveClientSideVodUrls(
       );
       if (metaRes.ok) {
         const metaJson = (await metaRes.json()) as {
-          files?: Array<{ name?: string; format?: string }>;
+          files?: Array<{ name?: string; format?: string; length?: string | number }>;
         };
         const files = metaJson.files || [];
         const videoFiles = files.filter(
           (f) => f.name && /\.(mp4|mkv|webm|mov|m4v|avi|ogg)$/i.test(f.name)
         );
-        // Prefer browser-native H.264 MP4/WebM first (avoids HEVC/MPEG-4 Part 2 audio-only black screen on GitHub Pages)
+        // Prefer browser-native H.264 MP4/WebM first (avoids HEVC/MPEG-4 Part 2 audio-only black screen and broken MKV seeking on GitHub Pages)
         videoFiles.sort((a, b) => {
           const aFmt = (a.format || '').toLowerCase();
           const bFmt = (b.format || '').toLowerCase();
@@ -406,7 +545,7 @@ export async function resolveClientSideVodUrls(
         const cleanSubBase = cleanSub.replace(/\.[a-z0-9]{2,5}$/i, '');
 
         const matchedList = [
-          // If the original subPath was an .mkv/.avi, prioritize a matching .mp4 derivative first so video renders in browser!
+          // If the original subPath was an .mkv/.avi, prioritize a matching .mp4 derivative first so video renders and seeks in browser!
           ...videoFiles.filter(
             (f) =>
               cleanSubBase &&
@@ -424,13 +563,29 @@ export async function resolveClientSideVodUrls(
           ...videoFiles,
         ];
 
-        for (const matched of matchedList.slice(0, 3)) {
+        let bestItemDuration: number | null = null;
+        for (const f of matchedList) {
+          const parsedDur = parseArchiveLengthField(f.length);
+          if (parsedDur && parsedDur > 0) {
+            bestItemDuration = Math.max(bestItemDuration || 0, parsedDur);
+          }
+        }
+        if (bestItemDuration) {
+          setCachedClientVodDuration(cleanUrl, bestItemDuration);
+        }
+
+        for (const matched of matchedList.slice(0, 4)) {
           if (matched?.name) {
             const encodedName = matched.name
               .split('/')
               .map((seg) => encodeURIComponent(seg))
               .join('/');
-            pushUnique(`https://archive.org/download/${itemId}/${encodedName}`);
+            const resolvedArchiveUrl = `https://archive.org/download/${itemId}/${encodedName}`;
+            const fileDur = parseArchiveLengthField(matched.length) || bestItemDuration;
+            if (fileDur) {
+              setCachedClientVodDuration(resolvedArchiveUrl, fileDur);
+            }
+            pushUnique(resolvedArchiveUrl);
           }
         }
       }

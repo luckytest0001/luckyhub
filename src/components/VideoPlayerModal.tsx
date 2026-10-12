@@ -11,8 +11,10 @@ import {
   Channel,
   DEFAULT_PLAYER_USER_AGENT,
   buildAuthenticatedXtreamAltUrls,
+  getCachedClientVodDuration,
   isYouTubeChannelUrl,
   openExternalChannelLink,
+  probeClientSideVodDuration,
   repairAndNormalizeChannel,
   resolveClientSideVodUrls,
 } from '../utils/playlistParser';
@@ -444,7 +446,16 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     };
 
     const corsProxyUrls = buildPublicCorsProxyUrls(cleanUrl);
-    const httpsSafeCleanUrls = getHttpsSafeMediaUrls(cleanUrl);
+    const isVodChannel = isExplicitNativeVod || isMkvAviOrLegacyContainer;
+    const httpsSafeCleanUrls = getHttpsSafeMediaUrls(cleanUrl, isVodChannel);
+    const resolvedVodCandidates: string[] = [cleanUrl];
+
+    const initialCachedDur = getCachedClientVodDuration(cleanUrl);
+    if (initialCachedDur && initialCachedDur > 0) {
+      knownVodDurationRef.current = initialCachedDur;
+      setIsLiveStream(false);
+      setDuration(initialCachedDur);
+    }
 
     if (!isHttpProtocol) {
       // RTMP / RTSP / UDP / MMS streams handled via server-side FFmpeg H.264 transcode
@@ -510,10 +521,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }
     } else if (isMkvAviOrLegacyContainer) {
       // On GitHub Pages / static hosts (or for HTTPS MKVs where browser plays Matroska natively),
-      // include MP4 Xtream variants and HTTPS-bridged direct playback so video & audio both work!
+      // include MP4 Xtream variants and HTTPS-bridged direct playback so video & audio & seek all work!
       if (isStaticDeploy) {
         if (xtreamAltUrls.vodMp4Url) {
-          for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url)) {
+          for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url, true)) {
             pushAttempt('native', safeMp4, true);
           }
         }
@@ -525,7 +536,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       pushAttempt('native', proxyUrl);
       if (xtreamAltUrls.vodMp4Url) {
         pushAttempt('native', buildProxyUrl(normalizedChannel, userAgent, xtreamAltUrls.vodMp4Url));
-        for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url)) {
+        for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url, true)) {
           pushAttempt('native', safeMp4, true);
         }
       }
@@ -534,7 +545,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }
     } else if (isExplicitNativeVod) {
       // Standard VOD (.mp4, .webm, .mov, /movie/, /series/, /vod/, Archive.org, Google Drive, Dropbox, Pixeldrain):
-      // Prioritize HTTPS-safe Direct & CORS-bridged playback so both https:// and http:// VODs play on GitHub Pages!
+      // Prioritize HTTPS-safe Direct playback so both https:// and http:// VODs play and seek on GitHub Pages!
       if ((isHttpsUrl || !isPageHttps || isStaticDeploy) && !hasMacAuth) {
         for (const safeUrl of httpsSafeCleanUrls) {
           pushAttempt('native', safeUrl, true);
@@ -545,21 +556,21 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         pushAttempt('native', safeUrl, true);
       }
       if (xtreamAltUrls.vodMp4Url && xtreamAltUrls.vodMp4Url !== cleanUrl) {
-        for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url)) {
+        for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url, true)) {
           pushAttempt('native', safeMp4, true);
         }
         pushAttempt('native', buildProxyUrl(normalizedChannel, userAgent, xtreamAltUrls.vodMp4Url));
       }
       if (xtreamAltUrls.vodMkvUrl && xtreamAltUrls.vodMkvUrl !== cleanUrl) {
         pushAttempt('native', buildProxyUrl(normalizedChannel, userAgent, xtreamAltUrls.vodMkvUrl));
-        for (const safeMkv of getHttpsSafeMediaUrls(xtreamAltUrls.vodMkvUrl)) {
+        for (const safeMkv of getHttpsSafeMediaUrls(xtreamAltUrls.vodMkvUrl, true)) {
           pushAttempt('native', safeMkv, true);
         }
       }
       pushAttempt('native', transcodeFullUrl);
       if (Hls.isSupported()) {
         pushAttempt('hls', proxyUrl);
-        for (const safeUrl of httpsSafeCleanUrls) {
+        for (const safeUrl of getHttpsSafeMediaUrls(cleanUrl, false)) {
           pushAttempt('hls', safeUrl, true);
         }
       }
@@ -616,28 +627,54 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       pushAttempt('native', transcodeFullUrl);
     }
 
+    const applyKnownDuration = (durSec: number | null | undefined) => {
+      if (!isMounted || !durSec || !Number.isFinite(durSec) || durSec <= 0) return;
+      const bestDur = Math.max(knownVodDurationRef.current || 0, durSec);
+      knownVodDurationRef.current = bestDur;
+      setIsLiveStream(false);
+      setDuration(bestDur);
+    };
+
     const probeController = new AbortController();
     const requestProbeDuration = () => {
-      if (
-        !isMounted ||
-        !canUseBackendProxy() ||
-        (knownVodDurationRef.current && knownVodDurationRef.current > 0)
-      ) {
+      if (!isMounted || (knownVodDurationRef.current && knownVodDurationRef.current > 0)) {
         return;
       }
-      fetch(buildProbeUrl(normalizedChannel, userAgent), {
-        signal: probeController.signal,
-      })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data: { duration?: number | null } | null) => {
-          if (isMounted && data?.duration && Number.isFinite(data.duration) && data.duration > 0) {
-            const bestDur = Math.max(knownVodDurationRef.current || 0, data.duration);
-            knownVodDurationRef.current = bestDur;
-            setIsLiveStream(false);
-            setDuration(bestDur);
-          }
+      // 1. Check cached client-side duration (e.g. from Archive.org metadata)
+      for (const u of resolvedVodCandidates) {
+        const cached = getCachedClientVodDuration(u);
+        if (cached && cached > 0) {
+          applyKnownDuration(cached);
+          return;
+        }
+      }
+      // 2. If backend /api/probe is available, query it
+      if (canUseBackendProxy()) {
+        fetch(buildProbeUrl(normalizedChannel, userAgent), {
+          signal: probeController.signal,
         })
-        .catch(() => {});
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data: { duration?: number | null } | null) => {
+            if (data?.duration && Number.isFinite(data.duration) && data.duration > 0) {
+              applyKnownDuration(data.duration);
+            }
+          })
+          .catch(() => {});
+      }
+      // 3. Also run client-side duration probe (works on static GitHub Pages without /api/probe!)
+      if (isVodChannel) {
+        probeClientSideVodDuration(
+          normalizedChannel,
+          resolvedVodCandidates,
+          probeController.signal
+        )
+          .then((dur) => {
+            if (dur && dur > 0) {
+              applyKnownDuration(dur);
+            }
+          })
+          .catch(() => {});
+      }
     };
 
     const safePlayVideo = () => {
@@ -655,20 +692,77 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }
     };
 
+    /**
+     * Reconnects or seeks the active stream on static hosts (GitHub Pages) where /api/transcode is unavailable,
+     * OR switches to server-side FFmpeg /api/transcode when backend proxy is available.
+     */
     const startTranscodeAt = (targetSec: number) => {
       if (!isMounted) return;
       const safeSec = Math.max(0, Math.floor(targetSec));
 
-      // If backend transcode server is unavailable (e.g. pure static GitHub Pages without remote backend),
-      // perform native seek or reload direct stream instead of failing on /api/transcode!
+      // If backend transcode server is unavailable (e.g. GitHub Pages static deployment),
+      // perform a full client-side stream reload & resume at safeSec so both seek and auto-reconnect work!
       if (!canUseBackendProxy()) {
+        clearTimers();
         seekBaseOffsetRef.current = 0;
-        try {
-          video.currentTime = safeSec;
-          safePlayVideo();
-        } catch {
-          // ignore
+        lastKnownTimestamp = safeSec;
+        pendingInitialSeekSec = safeSec > 1 ? safeSec : 0;
+        setHasError(false);
+        setIsLoading(true);
+        if (!userPausedRef.current) {
+          setIsPlaying(true);
         }
+
+        // If the device is currently offline, wait and retry automatically without failing attempts
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          reconnectTimer = window.setTimeout(() => {
+            if (isMounted) startTranscodeAt(safeSec);
+          }, 2500);
+          return;
+        }
+
+        const activeAttempt = attempts[currentAttemptIdx];
+        if (activeAttempt?.mode === 'hls' && hls && reconnectRetries <= 2) {
+          const tokenNow = attemptToken;
+          try {
+            hls.stopLoad();
+            hls.startLoad(safeSec > 1 ? safeSec : -1);
+            if (safeSec > 1) {
+              video.currentTime = safeSec;
+            }
+            safePlayVideo();
+            stallTimer = window.setTimeout(() => {
+              if (!isMounted || tokenNow !== attemptToken) return;
+              if (video.readyState < 3 || video.paused) {
+                runAttempt(currentAttemptIdx, safeSec, true);
+              }
+            }, 6500);
+            return;
+          } catch {
+            // Fall through to full runAttempt reload
+          }
+        }
+
+        // If currently on an .mkv attempt and seeking/reconnecting at safeSec > 1,
+        // prefer any .mp4 variant in attempts since .mp4 supports fast HTTP Range seeking in browsers
+        let targetIdx = currentAttemptIdx < attempts.length ? currentAttemptIdx : 0;
+        if (
+          safeSec > 1 &&
+          activeAttempt &&
+          /\.(mkv|avi|ts)(\?|$|#)/i.test(activeAttempt.url)
+        ) {
+          const mp4Idx = attempts.findIndex(
+            (a) =>
+              a.mode === 'native' &&
+              !a.url.includes('/api/') &&
+              /\.(mp4|webm|m4v)(\?|$|#)/i.test(a.url)
+          );
+          if (mp4Idx !== -1) {
+            targetIdx = mp4Idx;
+          }
+        }
+
+        runAttempt(targetIdx, safeSec, true);
         return;
       }
 
@@ -708,7 +802,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
             (a) => a.isDirect && a.mode === 'native'
           );
           if (directFallbackIdx !== -1 && reconnectRetries >= 1) {
-            runAttempt(directFallbackIdx, safeSec);
+            runAttempt(directFallbackIdx, safeSec, true);
             return;
           }
           if (reconnectRetries < 3) {
@@ -733,7 +827,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }, 45);
     };
 
-    const advanceToNextAttempt = (fromToken: number) => {
+    const advanceToNextAttempt = (fromToken: number, resumeSec = lastKnownTimestamp) => {
       if (!isMounted || fromToken !== attemptToken) return;
       let nextIdx = currentAttemptIdx + 1;
       // Skip backend /api/proxy and /api/transcode attempts if backend proxy was probed and found unreachable
@@ -745,13 +839,13 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       ) {
         nextIdx += 1;
       }
-      runAttempt(nextIdx);
+      runAttempt(nextIdx, resumeSec);
     };
 
     const jumpToTranscodeOrNext = (fromToken: number) => {
       if (!isMounted || fromToken !== attemptToken) return;
       if (!canUseBackendProxy()) {
-        advanceToNextAttempt(fromToken);
+        advanceToNextAttempt(fromToken, lastKnownTimestamp);
         return;
       }
       if (lastKnownTimestamp > 2) {
@@ -762,17 +856,42 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         (a, i) => i > currentAttemptIdx && a.url.includes('/api/transcode')
       );
       if (transcodeIdx !== -1) {
-        runAttempt(transcodeIdx);
+        runAttempt(transcodeIdx, lastKnownTimestamp);
       } else {
-        advanceToNextAttempt(fromToken);
+        advanceToNextAttempt(fromToken, lastKnownTimestamp);
       }
     };
 
-    const runAttempt = (idx: number, resumeAtSec = 0) => {
+    const runAttempt = (idx: number, resumeAtSec = 0, isReconnectReload = false) => {
       if (!isMounted) return;
       clearTimers();
 
       if (idx >= attempts.length) {
+        // Before giving up permanently when playback had already started or when device is offline,
+        // retry the first valid attempt so temporary Wi-Fi / mobile data drops auto-recover!
+        if (
+          (typeof navigator !== 'undefined' && navigator.onLine === false) ||
+          ((hasPlaybackStarted || lastKnownTimestamp > 1) && reconnectRetries < 6)
+        ) {
+          reconnectRetries += 1;
+          let firstValidIdx = 0;
+          while (
+            firstValidIdx < attempts.length &&
+            !canUseBackendProxy() &&
+            (attempts[firstValidIdx].url.includes('/api/proxy') ||
+              attempts[firstValidIdx].url.includes('/api/transcode'))
+          ) {
+            firstValidIdx += 1;
+          }
+          if (firstValidIdx < attempts.length) {
+            reconnectTimer = window.setTimeout(() => {
+              if (isMounted) {
+                runAttempt(firstValidIdx, lastKnownTimestamp, true);
+              }
+            }, 2200);
+            return;
+          }
+        }
         triggerStreamError();
         return;
       }
@@ -784,6 +903,9 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       recoveredMediaError = false;
       hasPlaybackStarted = false;
       pendingInitialSeekSec = resumeAtSec > 1 ? resumeAtSec : 0;
+      if (resumeAtSec > 1) {
+        lastKnownTimestamp = resumeAtSec;
+      }
       let preStartNetworkErrors = 0;
 
       if (attempt.url.includes('/api/transcode') && pendingInitialSeekSec > 0) {
@@ -803,15 +925,17 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         if (!isMounted || myToken !== attemptToken) return;
         isTransitioning = false;
 
-        // Set a safety stall timeout in case this attempt hangs without starting playback
+        // Allow 15s for direct VOD attempts (Archive.org / CDN redirects + MP4 moov headers)
         const timeoutMs = attempt.isDirect
-          ? 6500
+          ? isVodChannel
+            ? 15000
+            : 7500
           : attempt.url.includes('/api/transcode')
           ? 20000
           : 12000;
         stallTimer = window.setTimeout(() => {
           if (!isMounted || myToken !== attemptToken || hasPlaybackStarted) return;
-          advanceToNextAttempt(myToken);
+          advanceToNextAttempt(myToken, pendingInitialSeekSec || lastKnownTimestamp);
         }, timeoutMs);
 
         if (attempt.mode === 'hls' && Hls.isSupported()) {
@@ -820,12 +944,12 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
             lowLatencyMode: false,
             backBufferLength: 60,
             startPosition: pendingInitialSeekSec > 0 ? pendingInitialSeekSec : -1,
-            manifestLoadingTimeOut: attempt.isDirect ? 5500 : 10000,
-            manifestLoadingMaxRetry: attempt.isDirect ? 0 : 1,
-            levelLoadingTimeOut: attempt.isDirect ? 5500 : 10000,
-            levelLoadingMaxRetry: attempt.isDirect ? 0 : 1,
-            fragLoadingTimeOut: attempt.isDirect ? 6500 : 12000,
-            fragLoadingMaxRetry: attempt.isDirect ? 0 : 2,
+            manifestLoadingTimeOut: attempt.isDirect ? 7500 : 10000,
+            manifestLoadingMaxRetry: attempt.isDirect ? 1 : 2,
+            levelLoadingTimeOut: attempt.isDirect ? 7500 : 10000,
+            levelLoadingMaxRetry: attempt.isDirect ? 1 : 2,
+            fragLoadingTimeOut: attempt.isDirect ? 9000 : 12000,
+            fragLoadingMaxRetry: attempt.isDirect ? 2 : 3,
           });
           hls.loadSource(attempt.url);
           hls.attachMedia(video);
@@ -895,12 +1019,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
               Number.isFinite(data.details.totalduration) &&
               data.details.totalduration > 0
             ) {
-              const bestDur = Math.max(
-                knownVodDurationRef.current || 0,
-                data.details.totalduration
-              );
-              knownVodDurationRef.current = bestDur;
-              setDuration(bestDur);
+              applyKnownDuration(data.details.totalduration);
             }
           });
 
@@ -910,7 +1029,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
             if (!hasPlaybackStarted && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
               preStartNetworkErrors += 1;
               if (attempt.isDirect || data.fatal || preStartNetworkErrors >= 2) {
-                advanceToNextAttempt(myToken);
+                advanceToNextAttempt(myToken, pendingInitialSeekSec || lastKnownTimestamp);
                 return;
               }
             }
@@ -926,7 +1045,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
                 if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
                 reconnectTimer = window.setTimeout(() => {
                   if (!isMounted || myToken !== attemptToken) return;
-                  if (attempt.isDirect) {
+                  if (attempt.isDirect && canUseBackendProxy()) {
                     const proxyHlsIdx = attempts.findIndex(
                       (a, i) => i > currentAttemptIdx && a.mode === 'hls' && !a.isDirect
                     );
@@ -941,9 +1060,9 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
                   } else {
                     startTranscodeAt(savedTime);
                   }
-                }, 1000);
+                }, 1200);
               } else {
-                advanceToNextAttempt(myToken);
+                advanceToNextAttempt(myToken, lastKnownTimestamp);
               }
             }
           });
@@ -952,7 +1071,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
           mpegtsPlayer = mpegts.createPlayer(
             {
               type: isFlv ? 'flv' : 'mpegts',
-              isLive: true,
+              isLive: !isVodChannel,
               url: attempt.url,
             },
             {
@@ -966,19 +1085,29 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
 
           mpegtsPlayer.on(mpegts.Events.ERROR, () => {
             if (!isMounted || myToken !== attemptToken) return;
-            if (hasPlaybackStarted && reconnectRetries < 4) {
+            if ((hasPlaybackStarted || lastKnownTimestamp > 1) && reconnectRetries < 5) {
               reconnectRetries += 1;
               setIsLoading(true);
               reconnectTimer = window.setTimeout(() => {
                 if (!isMounted || myToken !== attemptToken) return;
-                runAttempt(currentAttemptIdx, lastKnownTimestamp);
-              }, 1000);
+                runAttempt(currentAttemptIdx, lastKnownTimestamp, true);
+              }, 1200);
               return;
             }
-            advanceToNextAttempt(myToken);
+            advanceToNextAttempt(myToken, lastKnownTimestamp);
           });
         } else {
-          video.src = attempt.url;
+          // Native HTML5 <video> playback:
+          // Use W3C Media Fragment (#t=seconds) when resuming/reconnecting at an offset so the browser
+          // opens a fresh HTTP Range request without corrupting CORS proxy URLs or signed query strings!
+          const cleanBaseUrl = attempt.url.split('#')[0];
+          const srcWithFragment =
+            pendingInitialSeekSec > 1
+              ? `${cleanBaseUrl}#t=${Math.floor(pendingInitialSeekSec)}`
+              : isReconnectReload && attempt.url.includes('/api/proxy')
+              ? `${cleanBaseUrl}${cleanBaseUrl.includes('?') ? '&' : '?'}_rc=${Date.now()}`
+              : cleanBaseUrl;
+          video.src = srcWithFragment;
           video.load();
           if (attempt.url.includes('/api/transcode')) {
             window.setTimeout(() => {
@@ -1016,7 +1145,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         return;
       }
 
-      // 2. If playing via mpegts.js, switch to FFmpeg transcode to seek
+      // 2. If playing via mpegts.js, delegate to startTranscodeAt (which handles both backend and static hosts)
       if (activeAttempt?.mode === 'mpegts' && mpegtsPlayer) {
         startTranscodeAt(safeTarget);
         return;
@@ -1045,16 +1174,42 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         return;
       }
 
-      // 4. Native HTML5 <video> playback (/api/proxy or direct MP4/WebM/MKV)
-      // Always attempt native browser seeking first so direct VOD streams on GitHub Pages work without /api/transcode!
+      // 4. Native HTML5 <video> playback (/api/proxy or direct MP4/WebM/MKV on GitHub Pages)
+      // If video has not loaded metadata yet or is in an error state when user seeks,
+      // store pendingInitialSeekSec and reload/resume at safeTarget!
+      if (video.error || video.readyState < 1 || !video.src) {
+        pendingInitialSeekSec = safeTarget;
+        startTranscodeAt(safeTarget);
+        return;
+      }
+
       seekBaseOffsetRef.current = 0;
-      setIsLoading(true);
+      pendingInitialSeekSec = 0;
+
+      // Check if safeTarget is already inside the browser's buffered time ranges
+      let isTargetBuffered = false;
+      try {
+        for (let i = 0; i < video.buffered.length; i++) {
+          if (
+            safeTarget >= video.buffered.start(i) &&
+            safeTarget <= video.buffered.end(i)
+          ) {
+            isTargetBuffered = true;
+            break;
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      if (!isTargetBuffered) {
+        setIsLoading(true);
+      }
+
       try {
         video.currentTime = safeTarget;
       } catch {
-        if (canUseBackendProxy()) {
-          startTranscodeAt(safeTarget);
-        }
+        startTranscodeAt(safeTarget);
         return;
       }
       safePlayVideo();
@@ -1064,25 +1219,26 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         seekFallbackTimer = null;
         if (!isMounted || tokenAtSeek !== attemptToken) return;
         const currentSrcNow = video.src || '';
-        if (currentSrcNow.includes('/api/transcode') || !canUseBackendProxy()) return;
+        if (currentSrcNow.includes('/api/transcode')) return;
 
-        // If the browser snapped currentTime back (e.g. upstream ignored Range header), fall back to /api/transcode
+        // If the browser snapped currentTime back (e.g. MKV without Cues or upstream ignored Range header),
+        // switch to an .mp4 variant (on GitHub Pages) or /api/transcode (on backend) at safeTarget!
         if (!video.seeking && Math.abs(video.currentTime - safeTarget) > 14) {
           startTranscodeAt(safeTarget);
           return;
         }
 
-        // If still stuck seeking after 7.5s, fall back to /api/transcode
+        // If still stuck seeking after 8.5s, reload stream at safeTarget
         if (video.seeking) {
           seekFallbackTimer = window.setTimeout(() => {
             seekFallbackTimer = null;
-            if (!isMounted || tokenAtSeek !== attemptToken || !canUseBackendProxy()) return;
+            if (!isMounted || tokenAtSeek !== attemptToken) return;
             if (video.seeking || Math.abs(video.currentTime - safeTarget) > 14) {
               startTranscodeAt(safeTarget);
             }
           }, 6000);
         }
-      }, 2200);
+      }, 2500);
     };
 
     playerControlRef.current = { seekTo: performSeek };
@@ -1202,17 +1358,40 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }, 9000);
     };
 
+    const handleSeeked = () => {
+      if (!isMounted || isTransitioning) return;
+      clearSeekFallbackTimer();
+      clearWaitingWatchdog();
+      if (!video.seeking && video.readyState >= 2) {
+        setIsLoading(false);
+      }
+      if (!userPausedRef.current) {
+        safePlayVideo();
+      }
+    };
+
     const handleWaiting = () => {
       if (!isMounted || isTransitioning) return;
       setIsLoading(true);
       scheduleWaitingReconnectWatchdog();
     };
 
+    const handleStalled = () => {
+      if (!isMounted || isTransitioning || userPausedRef.current) return;
+      // Browsers fire 'stalled' whenever network download pauses for ~3s, which happens normally
+      // on direct VOD playback on GitHub Pages after a seek or burst buffer fills up!
+      // Only enter loading/reconnect watchdog if playback is actually starved of frames.
+      if (video.readyState < 3 || video.seeking) {
+        setIsLoading(true);
+        scheduleWaitingReconnectWatchdog();
+      }
+    };
+
     const handleEnded = () => {
       if (!isMounted || isTransitioning) return;
       const effectiveDur = knownVodDurationRef.current || duration || 0;
       const effectiveNow = seekBaseOffsetRef.current + video.currentTime;
-      // If a VOD stream (especially chunked /api/transcode) ended more than 15s before its actual duration,
+      // If a VOD stream ended more than 15s before its actual duration,
       // the upstream connection dropped prematurely — automatically reconnect at effectiveNow!
       if (effectiveDur > 30 && effectiveNow < effectiveDur - 15 && reconnectRetries < 6) {
         reconnectRetries += 1;
@@ -1249,49 +1428,38 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         }
       }
 
-      if ((hasPlaybackStarted || lastKnownTimestamp > 1) && reconnectRetries < 5) {
+      if ((hasPlaybackStarted || lastKnownTimestamp > 1) && reconnectRetries < 6) {
         reconnectRetries += 1;
         const savedTime = lastKnownTimestamp;
         setHasError(false);
         setIsLoading(true);
         if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+        const retryDelayMs = Math.min(4000, 900 * reconnectRetries);
         reconnectTimer = window.setTimeout(() => {
           if (!isMounted) return;
-
-          // If backend proxy/transcode is available and direct playback failed mid-stream:
-          if (canUseBackendProxy() && (isTranscode || reconnectRetries >= 2)) {
-            startTranscodeAt(savedTime);
-            return;
-          }
-
-          // Reload active URL (direct or proxy) and restore savedTime
-          seekBaseOffsetRef.current = 0;
-          const targetReloadUrl = activeAttempt?.isDirect ? activeAttempt.url : proxyUrl;
-          const sep = targetReloadUrl.includes('?') ? '&' : '?';
-          video.src = `${targetReloadUrl}${sep}_rc=${Date.now()}`;
-          video.load();
-          if (savedTime > 1) {
-            const onMeta = () => {
-              if (!isMounted) return;
-              try {
-                video.currentTime = savedTime;
-              } catch {
-                if (canUseBackendProxy()) {
-                  startTranscodeAt(savedTime);
-                }
-                return;
-              }
-              safePlayVideo();
-            };
-            video.addEventListener('loadedmetadata', onMeta, { once: true });
-          } else {
-            safePlayVideo();
-          }
-        }, 1000);
+          startTranscodeAt(savedTime);
+        }, retryDelayMs);
         return;
       }
 
-      advanceToNextAttempt(attemptToken);
+      advanceToNextAttempt(attemptToken, lastKnownTimestamp);
+    };
+
+    const extractFiniteOrSeekableDuration = (): number | null => {
+      if (video.duration && Number.isFinite(video.duration) && video.duration > 0) {
+        return seekBaseOffsetRef.current + video.duration;
+      }
+      if (isVodChannel && video.seekable && video.seekable.length > 0) {
+        try {
+          const seekEnd = video.seekable.end(video.seekable.length - 1);
+          if (Number.isFinite(seekEnd) && seekEnd > 30) {
+            return seekBaseOffsetRef.current + seekEnd;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return null;
     };
 
     const handleTimeUpdate = () => {
@@ -1300,22 +1468,16 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       if (video.currentTime > 0.2) {
         clearWaitingWatchdog();
       }
+      if (!video.seeking && !video.paused && video.readyState >= 2) {
+        setIsLoading(false);
+      }
       lastKnownTimestamp = effectiveTime;
       if (!isScrubbingRef.current) {
         setCurrentTime(effectiveTime);
       }
-      if (
-        video.duration &&
-        Number.isFinite(video.duration) &&
-        video.duration > 0
-      ) {
-        const bestDur = Math.max(
-          knownVodDurationRef.current || 0,
-          seekBaseOffsetRef.current + video.duration
-        );
-        knownVodDurationRef.current = bestDur;
-        setIsLiveStream(false);
-        setDuration(bestDur);
+      const detectedDur = extractFiniteOrSeekableDuration();
+      if (detectedDur && detectedDur > 0) {
+        applyKnownDuration(detectedDur);
       } else if (knownVodDurationRef.current && knownVodDurationRef.current > 0) {
         setIsLiveStream(false);
         setDuration(knownVodDurationRef.current);
@@ -1328,68 +1490,65 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         const target = pendingInitialSeekSec;
         pendingInitialSeekSec = 0;
         try {
-          video.currentTime = target;
+          if (Math.abs(video.currentTime - target) > 1.5) {
+            video.currentTime = target;
+          }
         } catch {
           // ignore
         }
       }
-      if (
-        video.duration &&
-        Number.isFinite(video.duration) &&
-        video.duration > 0
-      ) {
-        const bestDur = Math.max(
-          knownVodDurationRef.current || 0,
-          seekBaseOffsetRef.current + video.duration
-        );
-        knownVodDurationRef.current = bestDur;
-        setIsLiveStream(false);
-        setDuration(bestDur);
+      const detectedDur = extractFiniteOrSeekableDuration();
+      if (detectedDur && detectedDur > 0) {
+        applyKnownDuration(detectedDur);
       } else if (knownVodDurationRef.current && knownVodDurationRef.current > 0) {
         setIsLiveStream(false);
         setDuration(knownVodDurationRef.current);
       } else {
-        setIsLiveStream(true);
+        setIsLiveStream(!isVodChannel);
+        if (isVodChannel) {
+          requestProbeDuration();
+        }
       }
       confirmOrWatchVideoTrack();
     };
 
     const handleDurationChange = () => {
       if (!isMounted || isTransitioning) return;
-      if (
-        video.duration &&
-        Number.isFinite(video.duration) &&
-        video.duration > 0
-      ) {
-        const bestDur = Math.max(
-          knownVodDurationRef.current || 0,
-          seekBaseOffsetRef.current + video.duration
-        );
-        knownVodDurationRef.current = bestDur;
-        setIsLiveStream(false);
-        setDuration(bestDur);
+      const detectedDur = extractFiniteOrSeekableDuration();
+      if (detectedDur && detectedDur > 0) {
+        applyKnownDuration(detectedDur);
       }
     };
 
     const handleNetworkOnline = () => {
       if (!isMounted || userPausedRef.current) return;
       reconnectRetries = 0;
-      if (hasError || video.error || video.readyState < 3) {
+      if (hasError || video.error || video.readyState < 3 || video.paused) {
         setHasError(false);
         setIsLoading(true);
         if (lastKnownTimestamp > 1) {
           startTranscodeAt(lastKnownTimestamp);
         } else {
-          runAttempt(0);
+          let firstValidIdx = 0;
+          while (
+            firstValidIdx < attempts.length &&
+            !canUseBackendProxy() &&
+            (attempts[firstValidIdx].url.includes('/api/proxy') ||
+              attempts[firstValidIdx].url.includes('/api/transcode'))
+          ) {
+            firstValidIdx += 1;
+          }
+          runAttempt(firstValidIdx < attempts.length ? firstValidIdx : 0);
         }
       }
     };
 
     video.addEventListener('playing', handlePlaying);
     video.addEventListener('canplay', handlePlaying);
+    video.addEventListener('seeked', handleSeeked);
     video.addEventListener('resize', handleResize);
     video.addEventListener('waiting', handleWaiting);
-    video.addEventListener('stalled', handleWaiting);
+    video.addEventListener('stalled', handleStalled);
     video.addEventListener('ended', handleEnded);
     video.addEventListener('error', handleVideoError);
     video.addEventListener('timeupdate', handleTimeUpdate);
@@ -1432,16 +1591,39 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
           probeController.signal
         );
         if (!isMounted) return;
+        for (const rUrl of resolvedUrls) {
+          if (rUrl && !resolvedVodCandidates.includes(rUrl)) {
+            resolvedVodCandidates.unshift(rUrl);
+          }
+          const cachedDur = getCachedClientVodDuration(rUrl);
+          if (cachedDur && cachedDur > 0) {
+            applyKnownDuration(cachedDur);
+          }
+        }
+
+        const primaryResolved = resolvedUrls[0];
+        if (primaryResolved && primaryResolved !== cleanUrl) {
+          proxyUrl = buildProxyUrl(normalizedChannel, userAgent, primaryResolved, resolvedBase);
+          transcodeFullUrl = buildTranscodeUrl(
+            normalizedChannel,
+            'full',
+            0,
+            userAgent,
+            primaryResolved,
+            resolvedBase
+          );
+        }
+
         for (let i = resolvedUrls.length - 1; i >= 0; i--) {
           const rUrl = resolvedUrls[i];
-          if (rUrl && rUrl !== cleanUrl) {
+          if (rUrl) {
             if (canUseBackendProxy()) {
               attempts.unshift({
                 mode: 'native',
                 url: buildProxyUrl(normalizedChannel, userAgent, rUrl, resolvedBase),
               });
             }
-            const safeResolvedList = getHttpsSafeMediaUrls(rUrl);
+            const safeResolvedList = getHttpsSafeMediaUrls(rUrl, true);
             for (let j = safeResolvedList.length - 1; j >= 0; j--) {
               attempts.unshift({
                 mode: 'native',
@@ -1466,13 +1648,13 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
 
       runAttempt(firstIdx);
 
-      // Delay duration probe by 1800ms so native <video> metadata can populate duration first
+      // Delay duration probe by 1200ms so native <video> metadata can populate duration first
       // without opening a competing upstream connection on 1-connection-limit VOD servers!
       window.setTimeout(() => {
         if (isMounted && !knownVodDurationRef.current) {
           requestProbeDuration();
         }
-      }, 1800);
+      }, 1200);
     };
 
     startPlaybackPipeline();
@@ -1485,9 +1667,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       destroyPlayers();
       video.removeEventListener('playing', handlePlaying);
       video.removeEventListener('canplay', handlePlaying);
+      video.removeEventListener('seeked', handleSeeked);
       video.removeEventListener('resize', handleResize);
       video.removeEventListener('waiting', handleWaiting);
-      video.removeEventListener('stalled', handleWaiting);
+      video.removeEventListener('stalled', handleStalled);
       video.removeEventListener('ended', handleEnded);
       video.removeEventListener('error', handleVideoError);
       video.removeEventListener('timeupdate', handleTimeUpdate);
