@@ -180,9 +180,10 @@ export function canUseBackendProxy(): boolean {
 export function buildPublicCorsProxyUrls(targetUrl: string): string[] {
   if (!/^https?:\/\//i.test(targetUrl)) return [];
   return [
-    `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`,
+    `https://api.cors.lol/?url=${encodeURIComponent(targetUrl)}`,
     `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
     `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
+    `https://cors.eu.org/${targetUrl}`,
   ];
 }
 
@@ -222,7 +223,8 @@ export function getHttpsSafeMediaUrls(rawUrl: string, forNativeVideo = false): s
 
   // 2. Bridge plain http:// VOD/stream over HTTPS
   if (forNativeVideo) {
-    pushUnique(`https://corsproxy.io/?${encodeURIComponent(rawUrl)}`);
+    pushUnique(`https://api.cors.lol/?url=${encodeURIComponent(rawUrl)}`);
+    pushUnique(`https://cors.eu.org/${rawUrl}`);
   } else {
     for (const corsUrl of buildPublicCorsProxyUrls(rawUrl)) {
       pushUnique(corsUrl);

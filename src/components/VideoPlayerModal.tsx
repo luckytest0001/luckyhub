@@ -26,6 +26,11 @@ import {
   getHttpsSafeMediaUrls,
   isStaticHostEnvironment,
 } from '../utils/proxyHelper';
+import {
+  ClientTranscodeResult,
+  transcodeChannelClientSide,
+  warmupClientFfmpeg,
+} from '../utils/clientFfmpegTranscoder';
 
 interface VideoPlayerModalProps {
   channel: Channel;
@@ -307,6 +312,37 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     let reconnectTimer: number | null = null;
     let waitingWatchdogTimer: number | null = null;
     let seekFallbackTimer: number | null = null;
+    let isClientFfmpegActive = false;
+    let activeClientBlobUrl: string | null = null;
+    let currentClientSegmentDuration = 28;
+    let clientFfmpegAbort: AbortController | null = null;
+    let nextClientSegment: {
+      startSec: number;
+      promise: Promise<ClientTranscodeResult | null>;
+    } | null = null;
+
+    const revokeClientBlob = () => {
+      if (activeClientBlobUrl) {
+        try {
+          URL.revokeObjectURL(activeClientBlobUrl);
+        } catch {
+          // ignore
+        }
+        activeClientBlobUrl = null;
+      }
+    };
+
+    const abortClientFfmpeg = () => {
+      if (clientFfmpegAbort) {
+        try {
+          clientFfmpegAbort.abort();
+        } catch {
+          // ignore
+        }
+        clientFfmpegAbort = null;
+      }
+      nextClientSegment = null;
+    };
 
     const clearWaitingWatchdog = () => {
       if (waitingWatchdogTimer !== null) {
@@ -433,12 +469,16 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         : undefined;
 
     const attempts: Array<{
-      mode: 'native' | 'hls' | 'mpegts';
+      mode: 'native' | 'hls' | 'mpegts' | 'client-ffmpeg';
       url: string;
       isDirect?: boolean;
     }> = [];
 
-    const pushAttempt = (mode: 'native' | 'hls' | 'mpegts', url?: string, isDirect?: boolean) => {
+    const pushAttempt = (
+      mode: 'native' | 'hls' | 'mpegts' | 'client-ffmpeg',
+      url?: string,
+      isDirect?: boolean
+    ) => {
       if (!url) return;
       if (!attempts.some((a) => a.mode === mode && a.url === url)) {
         attempts.push({ mode, url, isDirect });
@@ -449,6 +489,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     const isVodChannel = isExplicitNativeVod || isMkvAviOrLegacyContainer;
     const httpsSafeCleanUrls = getHttpsSafeMediaUrls(cleanUrl, isVodChannel);
     const resolvedVodCandidates: string[] = [cleanUrl];
+
+    if (isStaticDeploy) {
+      warmupClientFfmpeg();
+    }
 
     const initialCachedDur = getCachedClientVodDuration(cleanUrl);
     if (initialCachedDur && initialCachedDur > 0) {
@@ -492,6 +536,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       pushAttempt('native', proxyUrl);
       pushAttempt('native', cleanUrl, true);
       pushAttempt('native', transcodeFullUrl);
+      pushAttempt('client-ffmpeg', cleanUrl);
     } else if (isExplicitTsOrFlv) {
       if (mpegts.isSupported()) {
         if (isStaticDeploy) {
@@ -519,6 +564,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       for (const safeUrl of httpsSafeCleanUrls) {
         pushAttempt('native', safeUrl, true);
       }
+      pushAttempt('client-ffmpeg', cleanUrl);
     } else if (isMkvAviOrLegacyContainer) {
       // On GitHub Pages / static hosts (or for HTTPS MKVs where browser plays Matroska natively),
       // include MP4 Xtream variants and HTTPS-bridged direct playback so video & audio & seek all work!
@@ -543,6 +589,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       for (const safeUrl of httpsSafeCleanUrls) {
         pushAttempt('native', safeUrl, true);
       }
+      pushAttempt('client-ffmpeg', cleanUrl);
     } else if (isExplicitNativeVod) {
       // Standard VOD (.mp4, .webm, .mov, /movie/, /series/, /vod/, Archive.org, Google Drive, Dropbox, Pixeldrain):
       // Prioritize HTTPS-safe Direct playback so both https:// and http:// VODs play and seek on GitHub Pages!
@@ -568,6 +615,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         }
       }
       pushAttempt('native', transcodeFullUrl);
+      pushAttempt('client-ffmpeg', cleanUrl);
       if (Hls.isSupported()) {
         pushAttempt('hls', proxyUrl);
         for (const safeUrl of getHttpsSafeMediaUrls(cleanUrl, false)) {
@@ -625,6 +673,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         pushAttempt('native', safeUrl, true);
       }
       pushAttempt('native', transcodeFullUrl);
+      pushAttempt('client-ffmpeg', cleanUrl);
     }
 
     const applyKnownDuration = (durSec: number | null | undefined) => {
@@ -693,12 +742,158 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     };
 
     /**
+     * Runs client-side WebAssembly FFmpeg transcoding (H.264 + AAC MP4) for static hosts like GitHub Pages
+     * when a video uses an unsupported codec (HEVC/MPEG-4 Part 2/MPEG-2) or non-native container.
+     */
+    const startClientFfmpegAt = (targetSec: number) => {
+      if (!isMounted) return;
+      const safeSec = Math.max(0, Math.floor(targetSec));
+      clearTimers();
+
+      const clientIdx = attempts.findIndex((a) => a.mode === 'client-ffmpeg');
+      if (clientIdx !== -1) {
+        currentAttemptIdx = clientIdx;
+      }
+
+      isClientFfmpegActive = true;
+      seekBaseOffsetRef.current = safeSec;
+      lastKnownTimestamp = safeSec;
+      pendingInitialSeekSec = 0;
+
+      attemptToken += 1;
+      const myToken = attemptToken;
+      recoveredMediaError = false;
+      hasPlaybackStarted = false;
+      isTransitioning = true;
+
+      setHasError(false);
+      setIsLoading(true);
+      if (!userPausedRef.current) {
+        setIsPlaying(true);
+      }
+
+      destroyPlayers();
+      video.removeAttribute('src');
+      video.load();
+
+      const scheduleNextPrefetch = (
+        nextStartSec: number,
+        totalDur: number | null,
+        controller: AbortController
+      ) => {
+        if (!isMounted || controller.signal.aborted) return;
+        if (totalDur && nextStartSec >= totalDur - 2) {
+          nextClientSegment = null;
+          return;
+        }
+        const segLen = 32;
+        const p = transcodeChannelClientSide(
+          normalizedChannel,
+          resolvedVodCandidates,
+          nextStartSec,
+          segLen,
+          totalDur,
+          controller.signal
+        ).catch(() => null);
+        nextClientSegment = { startSec: nextStartSec, promise: p };
+      };
+
+      const applyTranscodedSegment = (
+        res: ClientTranscodeResult,
+        controller: AbortController
+      ) => {
+        if (!isMounted || myToken !== attemptToken) {
+          try {
+            URL.revokeObjectURL(res.blobUrl);
+          } catch {
+            // ignore
+          }
+          return;
+        }
+        isTransitioning = false;
+        revokeClientBlob();
+        activeClientBlobUrl = res.blobUrl;
+        currentClientSegmentDuration = res.segmentDurationSec;
+        seekBaseOffsetRef.current = res.segmentStartSec;
+
+        if (res.durationSec && res.durationSec > 0) {
+          applyKnownDuration(res.durationSec);
+        }
+
+        video.src = res.blobUrl;
+        video.load();
+        safePlayVideo();
+
+        if (res.hasMoreSegments) {
+          scheduleNextPrefetch(
+            res.segmentStartSec + res.segmentDurationSec,
+            res.durationSec || knownVodDurationRef.current,
+            controller
+          );
+        } else {
+          nextClientSegment = null;
+        }
+      };
+
+      // Check if we already prefetched the matching next segment
+      if (
+        nextClientSegment &&
+        Math.abs(nextClientSegment.startSec - safeSec) <= 3 &&
+        clientFfmpegAbort &&
+        !clientFfmpegAbort.signal.aborted
+      ) {
+        const activeCtrl = clientFfmpegAbort;
+        const prefetchedPromise = nextClientSegment.promise;
+        nextClientSegment = null;
+        prefetchedPromise.then((res) => {
+          if (!isMounted || myToken !== attemptToken) return;
+          if (res) {
+            applyTranscodedSegment(res, activeCtrl);
+          } else {
+            // Prefetch failed; run fresh transcode at safeSec
+            nextClientSegment = null;
+            startClientFfmpegAt(safeSec);
+          }
+        });
+        return;
+      }
+
+      abortClientFfmpeg();
+      const ctrl = new AbortController();
+      clientFfmpegAbort = ctrl;
+
+      transcodeChannelClientSide(
+        normalizedChannel,
+        resolvedVodCandidates,
+        safeSec,
+        28,
+        knownVodDurationRef.current,
+        ctrl.signal
+      )
+        .then((res) => {
+          applyTranscodedSegment(res, ctrl);
+        })
+        .catch(() => {
+          if (!isMounted || myToken !== attemptToken || ctrl.signal.aborted) return;
+          isTransitioning = false;
+          isClientFfmpegActive = false;
+          advanceToNextAttempt(myToken, safeSec);
+        });
+    };
+
+    /**
      * Reconnects or seeks the active stream on static hosts (GitHub Pages) where /api/transcode is unavailable,
      * OR switches to server-side FFmpeg /api/transcode when backend proxy is available.
      */
     const startTranscodeAt = (targetSec: number) => {
       if (!isMounted) return;
       const safeSec = Math.max(0, Math.floor(targetSec));
+
+      // If client-side FFmpeg WASM is already active, seek/resume via client-side FFmpeg WASM!
+      if (isClientFfmpegActive) {
+        startClientFfmpegAt(safeSec);
+        return;
+      }
 
       // If backend transcode server is unavailable (e.g. GitHub Pages static deployment),
       // perform a full client-side stream reload & resume at safeSec so both seek and auto-reconnect work!
@@ -743,7 +938,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
           }
         }
 
-        // If currently on an .mkv attempt and seeking/reconnecting at safeSec > 1,
+        // If currently on an .mkv/.avi/.ts attempt and seeking/reconnecting at safeSec > 1,
         // prefer any .mp4 variant in attempts since .mp4 supports fast HTTP Range seeking in browsers
         let targetIdx = currentAttemptIdx < attempts.length ? currentAttemptIdx : 0;
         if (
@@ -759,6 +954,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
           );
           if (mp4Idx !== -1) {
             targetIdx = mp4Idx;
+          } else {
+            // No .mp4 alternative exists and native .mkv/.avi/.ts cannot seek — use Client-Side FFmpeg WASM!
+            startClientFfmpegAt(safeSec);
+            return;
           }
         }
 
@@ -845,7 +1044,20 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     const jumpToTranscodeOrNext = (fromToken: number) => {
       if (!isMounted || fromToken !== attemptToken) return;
       if (!canUseBackendProxy()) {
-        advanceToNextAttempt(fromToken, lastKnownTimestamp);
+        // On static hosts (GitHub Pages), if audio is playing without video (e.g. HEVC / mp4v / MPEG-2),
+        // check if there is another native .mp4 derivative (e.g. Archive.org .ia.mp4); otherwise launch Client-Side FFmpeg WASM!
+        const nextMp4Idx = attempts.findIndex(
+          (a, i) =>
+            i > currentAttemptIdx &&
+            a.mode === 'native' &&
+            !a.url.includes('/api/') &&
+            /\.(mp4|webm|m4v)(\?|$|#)/i.test(a.url)
+        );
+        if (nextMp4Idx !== -1) {
+          runAttempt(nextMp4Idx, lastKnownTimestamp);
+          return;
+        }
+        startClientFfmpegAt(lastKnownTimestamp);
         return;
       }
       if (lastKnownTimestamp > 2) {
@@ -908,11 +1120,19 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }
       let preStartNetworkErrors = 0;
 
+      if (attempt.mode === 'client-ffmpeg') {
+        startClientFfmpegAt(pendingInitialSeekSec || lastKnownTimestamp);
+        return;
+      }
+
       if (attempt.url.includes('/api/transcode') && pendingInitialSeekSec > 0) {
         startTranscodeAt(pendingInitialSeekSec);
         return;
       }
 
+      isClientFfmpegActive = false;
+      abortClientFfmpeg();
+      revokeClientBlob();
       seekBaseOffsetRef.current = 0;
 
       // Guard against asynchronous error events fired by detaching previous media sources
@@ -1136,10 +1356,11 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       const activeAttempt = attempts[currentAttemptIdx];
       const currentSrc = video.src || activeAttempt?.url || '';
       const isCurrentlyTranscoding =
+        isClientFfmpegActive ||
         currentSrc.includes('/api/transcode') ||
         Boolean(activeAttempt?.url.includes('/api/transcode'));
 
-      // 1. If already playing via FFmpeg transcode, seek via server-side FFmpeg -ss
+      // 1. If already playing via FFmpeg transcode (server or client WASM), seek via FFmpeg
       if (isCurrentlyTranscoding) {
         startTranscodeAt(safeTarget);
         return;
@@ -1248,6 +1469,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       const activeAttempt = attempts[currentAttemptIdx];
       const currentSrc = video.src || activeAttempt?.url || '';
       const isTranscodeAttempt =
+        isClientFfmpegActive ||
         currentSrc.includes('/api/transcode') ||
         Boolean(activeAttempt?.url.includes('/api/transcode'));
       const isStreamingEngine =
@@ -1391,6 +1613,18 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       if (!isMounted || isTransitioning) return;
       const effectiveDur = knownVodDurationRef.current || duration || 0;
       const effectiveNow = seekBaseOffsetRef.current + video.currentTime;
+
+      // When playing progressive segments via Client-Side WebAssembly FFmpeg,
+      // seamlessly advance to the next segment as soon as the current segment finishes!
+      if (isClientFfmpegActive) {
+        const nextSegStart =
+          seekBaseOffsetRef.current + (video.duration || currentClientSegmentDuration || 28);
+        if (!effectiveDur || nextSegStart < effectiveDur - 1.5) {
+          startClientFfmpegAt(nextSegStart);
+        }
+        return;
+      }
+
       // If a VOD stream ended more than 15s before its actual duration,
       // the upstream connection dropped prematurely — automatically reconnect at effectiveNow!
       if (effectiveDur > 30 && effectiveNow < effectiveDur - 15 && reconnectRetries < 6) {
@@ -1486,7 +1720,11 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
 
     const handleLoadedMetadata = () => {
       if (!isMounted || isTransitioning) return;
-      if (pendingInitialSeekSec > 0 && !video.src.includes('/api/transcode')) {
+      if (
+        pendingInitialSeekSec > 0 &&
+        !isClientFfmpegActive &&
+        !video.src.includes('/api/transcode')
+      ) {
         const target = pendingInitialSeekSec;
         pendingInitialSeekSec = 0;
         try {
@@ -1556,9 +1794,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     video.addEventListener('durationchange', handleDurationChange);
     window.addEventListener('online', handleNetworkOnline);
 
-    // Start playback (resolving Archive.org / truncated VOD URLs client-side if needed)
+    // Start playback (resolving Archive.org / CDN / truncated VOD URLs client-side if needed)
     const needsClientVodResolution =
-      /^https?:\/\/(?:www\.)?archive\.org\/(?:details|download)\//i.test(cleanUrl) ||
+      /^https?:\/\/(?:www\.)?archive\.org\/(?:details|download|stream)\//i.test(cleanUrl) ||
+      /^https?:\/\/[^/?#]+\.archive\.org\/(?:[^/?#]+\/)*items\//i.test(cleanUrl) ||
       ((isExplicitNativeVod || isMkvAviOrLegacyContainer) &&
         !/\.(mp4|mkv|m3u8|ts|webm|avi|mov|m4v|flv|ogg)(\?|$)/i.test(cleanUrl));
 
@@ -1663,6 +1902,8 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       isMounted = false;
       playerControlRef.current = null;
       probeController.abort();
+      abortClientFfmpeg();
+      revokeClientBlob();
       clearTimers();
       destroyPlayers();
       video.removeEventListener('playing', handlePlaying);

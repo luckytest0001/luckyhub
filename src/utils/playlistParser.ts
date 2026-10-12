@@ -352,7 +352,7 @@ export function getCachedClientVodDuration(url?: string): number | undefined {
   return val && Number.isFinite(val) && val > 0 ? val : undefined;
 }
 
-function setCachedClientVodDuration(url: string | undefined, durationSec: number | null | undefined) {
+export function setCachedClientVodDuration(url: string | undefined, durationSec: number | null | undefined) {
   if (!url || !durationSec || !Number.isFinite(durationSec) || durationSec <= 0) return;
   clientVodDurationCache.set(url.split('#')[0], durationSec);
 }
@@ -501,17 +501,20 @@ export async function resolveClientSideVodUrls(
 
   const cleanUrl = normalizeVodMediaUrl(channel.url || '');
 
-  // 1. Archive.org /details/<id> or /download/<id>/<partial>
-  const archiveMatch = cleanUrl.match(
-    /^https?:\/\/(?:www\.)?archive\.org\/(?:details|download)\/([^/?#]+)(?:\/([^?#]*))?/i
-  );
+  // 1. Archive.org /details/<id>, /download/<id>/<partial>, or ia*.us.archive.org/.../items/<id>/<partial>
+  const archiveMatch =
+    cleanUrl.match(
+      /^https?:\/\/(?:www\.)?archive\.org\/(?:details|download|stream)\/([^/?#]+)(?:\/([^?#]*))?/i
+    ) ||
+    cleanUrl.match(
+      /^https?:\/\/[^/?#]+\.archive\.org\/(?:[^/?#]+\/)*items\/([^/?#]+)(?:\/([^?#]*))?/i
+    );
   if (archiveMatch) {
     const itemId = archiveMatch[1];
     const subPath = archiveMatch[2] ? safeDecodeURIComponent(archiveMatch[2]).trim() : '';
-    const isDirectMp4OrWebm = /\.(mp4|webm|m4v)(\?|$)/i.test(subPath);
+    const isAlreadyIaH264Mp4 = /\.ia\.mp4(\?|$)/i.test(subPath);
 
-    // Only place cleanUrl before metadata lookup if it is ALREADY a browser-native .mp4/.webm on /download/
-    if (isDirectMp4OrWebm && /\/download\//i.test(cleanUrl)) {
+    if (isAlreadyIaH264Mp4 && /\/download\//i.test(cleanUrl)) {
       pushUnique(cleanUrl);
     }
 
@@ -522,44 +525,58 @@ export async function resolveClientSideVodUrls(
       );
       if (metaRes.ok) {
         const metaJson = (await metaRes.json()) as {
-          files?: Array<{ name?: string; format?: string; length?: string | number }>;
+          files?: Array<{
+            name?: string;
+            format?: string;
+            original?: string;
+            length?: string | number;
+          }>;
         };
         const files = metaJson.files || [];
         const videoFiles = files.filter(
-          (f) => f.name && /\.(mp4|mkv|webm|mov|m4v|avi|ogg)$/i.test(f.name)
+          (f) => f.name && /\.(mp4|mkv|webm|mov|m4v|avi|ogg|ts)$/i.test(f.name)
         );
-        // Prefer browser-native H.264 MP4/WebM first (avoids HEVC/MPEG-4 Part 2 audio-only black screen and broken MKV seeking on GitHub Pages)
-        videoFiles.sort((a, b) => {
-          const aFmt = (a.format || '').toLowerCase();
-          const bFmt = (b.format || '').toLowerCase();
-          const aH264 = aFmt.includes('h.264') || aFmt.includes('mpeg4') ? 0 : 1;
-          const bH264 = bFmt.includes('h.264') || bFmt.includes('mpeg4') ? 0 : 1;
-          const aMp4 = /\.(mp4|webm|m4v)$/i.test(a.name || '') ? 0 : 1;
-          const bMp4 = /\.(mp4|webm|m4v)$/i.test(b.name || '') ? 0 : 1;
-          if (aMp4 !== bMp4) return aMp4 - bMp4;
-          return aH264 - bH264;
-        });
+        // Strictly prefer browser-native H.264 (.ia.mp4 / format: h.264) over generic MPEG4 (mp4v) or HEVC/MKV
+        // so the browser never plays audio-only with a black video screen on GitHub Pages!
+        const scoreVideoFile = (f: { name?: string; format?: string }) => {
+          const name = (f.name || '').toLowerCase();
+          const fmt = (f.format || '').toLowerCase();
+          const isMp4OrWebm = /\.(mp4|webm|m4v)$/i.test(name);
+          const isExplicitH264 = fmt.includes('h.264') || /\.ia\.mp4$/i.test(name);
+          if (isMp4OrWebm && isExplicitH264) return 0;
+          if (isMp4OrWebm && fmt.includes('mpeg4')) return 1;
+          if (isMp4OrWebm) return 2;
+          return 3;
+        };
+        videoFiles.sort((a, b) => scoreVideoFile(a) - scoreVideoFile(b));
 
         const cleanTitle = (channel.name || '').trim().toLowerCase();
         const cleanSub = subPath.toLowerCase();
-        const cleanSubBase = cleanSub.replace(/\.[a-z0-9]{2,5}$/i, '');
+        const cleanSubBase = cleanSub.replace(/(?:\.ia)?\.[a-z0-9]{2,5}$/i, '');
+
+        const stripBase = (n: string) =>
+          n.toLowerCase().replace(/(?:\.ia)?\.[a-z0-9]{2,5}$/i, '');
 
         const matchedList = [
-          // If the original subPath was an .mkv/.avi, prioritize a matching .mp4 derivative first so video renders and seeks in browser!
+          // 1. Exact H.264 / MP4 derivative of the requested file (via `original` field or base name match)
           ...videoFiles.filter(
             (f) =>
-              cleanSubBase &&
               /\.(mp4|webm|m4v)$/i.test(f.name || '') &&
-              f.name!.toLowerCase().replace(/\.[a-z0-9]{2,5}$/i, '') === cleanSubBase
+              ((cleanSub && (f.original || '').toLowerCase() === cleanSub) ||
+                (cleanSubBase && stripBase(f.name!) === cleanSubBase))
           ),
+          // 2. Exact filename match
           ...videoFiles.filter((f) => cleanSub && f.name!.toLowerCase() === cleanSub),
+          // 3. Prefix filename match
           ...videoFiles.filter((f) => cleanSub && f.name!.toLowerCase().startsWith(cleanSub)),
+          // 4. Channel title match
           ...videoFiles.filter(
             (f) =>
               cleanTitle &&
               (f.name!.toLowerCase().startsWith(cleanTitle) ||
                 f.name!.toLowerCase().includes(cleanTitle))
           ),
+          // 5. All remaining sorted video files in the item
           ...videoFiles,
         ];
 
@@ -574,7 +591,7 @@ export async function resolveClientSideVodUrls(
           setCachedClientVodDuration(cleanUrl, bestItemDuration);
         }
 
-        for (const matched of matchedList.slice(0, 4)) {
+        for (const matched of matchedList.slice(0, 5)) {
           if (matched?.name) {
             const encodedName = matched.name
               .split('/')
