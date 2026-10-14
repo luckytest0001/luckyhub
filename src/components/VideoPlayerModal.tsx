@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
 import {
@@ -61,7 +61,18 @@ function appendChannelAuthQueryParams(
   fallbackUa?: string,
   overrideTargetUrl?: string
 ): string {
-  const targetUrl = overrideTargetUrl || channel.url;
+  const rawTarget = (overrideTargetUrl || channel.originalUrl || channel.url || '').trim();
+  let targetUrl = rawTarget;
+  if (rawTarget.includes('/api/proxy?url=')) {
+    try {
+      const match = rawTarget.match(/[?&]url=([^&]+)/);
+      if (match && match[1]) {
+        targetUrl = decodeURIComponent(match[1]);
+      }
+    } catch {
+      // keep rawTarget
+    }
+  }
   let qs = `url=${encodeURIComponent(targetUrl)}`;
   const effectiveUa = channel.userAgent || fallbackUa || DEFAULT_PLAYER_USER_AGENT;
   if (effectiveUa) {
@@ -98,6 +109,10 @@ function buildProxyUrl(
   overrideTargetUrl?: string,
   baseUrlOverride?: string
 ): string {
+  const target = (overrideTargetUrl || channel.url || '').trim();
+  if (!overrideTargetUrl && target.includes('/api/proxy?')) {
+    return target;
+  }
   const base = baseUrlOverride !== undefined ? baseUrlOverride : getEffectiveApiBaseUrl();
   return `${base}/api/proxy?${appendChannelAuthQueryParams(channel, fallbackUa, overrideTargetUrl)}`;
 }
@@ -192,6 +207,84 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
   const [aspectRatioIdx, setAspectRatioIdx] = useState<number>(0); // 0 = 'Best Fit'
   const [videoScale, setVideoScale] = useState<number>(100); // 50% to 200%, default 100%
   const [showClockIdx, setShowClockIdx] = useState<number>(0); // 0 = 'Never'
+
+  // Orientation state: controls Vertical (Portrait) vs Horizontal (Landscape) mode
+  const [isLandscape, setIsLandscape] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      return window.innerWidth > window.innerHeight;
+    }
+    return true;
+  });
+  const [isPhysicalLandscape, setIsPhysicalLandscape] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      return window.innerWidth > window.innerHeight;
+    }
+    return true;
+  });
+  const [rotationHudText, setRotationHudText] = useState<string | null>(null);
+
+  const requestFullscreenSafe = useCallback(async () => {
+    try {
+      if (typeof document === 'undefined') return;
+      if (document.fullscreenElement || (document as any).webkitFullscreenElement) {
+        return;
+      }
+      const el = containerRef.current || document.documentElement;
+      if (el.requestFullscreen) {
+        await el.requestFullscreen({ navigationUI: 'hide' } as any);
+      } else if ((el as any).webkitRequestFullscreen) {
+        await (el as any).webkitRequestFullscreen();
+      } else if ((el as any).mozRequestFullScreen) {
+        await (el as any).mozRequestFullScreen();
+      } else if ((el as any).msRequestFullscreen) {
+        await (el as any).msRequestFullscreen();
+      }
+    } catch {
+      // Browser may require user gesture on first frame
+    }
+  }, []);
+
+  const exitFullscreenSafe = useCallback(() => {
+    try {
+      if (typeof document === 'undefined') return;
+      if (document.fullscreenElement || (document as any).webkitFullscreenElement) {
+        if (document.exitFullscreen) {
+          document.exitFullscreen().catch(() => {});
+        } else if ((document as any).webkitExitFullscreen) {
+          (document as any).webkitExitFullscreen().catch(() => {});
+        }
+      }
+      if (screen.orientation && typeof screen.orientation.unlock === 'function') {
+        screen.orientation.unlock();
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    requestFullscreenSafe();
+
+    const handleOrientationOrResize = () => {
+      const physicalLandscape = window.innerWidth > window.innerHeight;
+      setIsPhysicalLandscape(physicalLandscape);
+    };
+
+    window.addEventListener('resize', handleOrientationOrResize);
+    window.addEventListener('orientationchange', handleOrientationOrResize);
+    if (screen.orientation && 'addEventListener' in screen.orientation) {
+      screen.orientation.addEventListener('change', handleOrientationOrResize);
+    }
+
+    return () => {
+      window.removeEventListener('resize', handleOrientationOrResize);
+      window.removeEventListener('orientationchange', handleOrientationOrResize);
+      if (screen.orientation && 'removeEventListener' in screen.orientation) {
+        screen.orientation.removeEventListener('change', handleOrientationOrResize);
+      }
+      exitFullscreenSafe();
+    };
+  }, [requestFullscreenSafe, exitFullscreenSafe]);
 
   const gestureHudTimeoutRef = useRef<number | null>(null);
   const suppressNextClickRef = useRef<boolean>(false);
@@ -441,11 +534,14 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     const isMkvAviOrLegacyContainer =
       /\.(mkv|avi|wmv|mpg|mpeg|3gp|divx)(\?|$|#|&)/i.test(cleanUrl);
     const isExplicitNativeVod =
+      normalizedChannel.forceProxy ||
+      normalizedChannel.isProxied ||
+      cleanUrl.includes('/api/proxy?') ||
       /\.(mp4|webm|mov|m4v|ogg)(\?|$|#|&)/i.test(cleanUrl) ||
       /\/(movie|series|vod)\//i.test(cleanUrl) ||
       normalizedChannel.xtreamParams?.streamType === 'movie' ||
       normalizedChannel.xtreamParams?.streamType === 'series' ||
-      /archive\.org|drive\.usercontent\.google\.com|drive\.google\.com|pixeldrain\.com|dropbox\.com|dropboxusercontent\.com/i.test(
+      /archive\.org|drive\.usercontent\.google\.com|drive\.google\.com|pixeldrain\.(com|dev)|dropbox\.com|dropboxusercontent\.com/i.test(
         cleanUrl
       );
 
@@ -564,9 +660,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       }
       pushAttempt('client-ffmpeg', cleanUrl);
     } else if (isMkvAviOrLegacyContainer) {
-      // On GitHub Pages / static hosts (or for HTTPS MKVs where browser plays Matroska natively),
-      // include MP4 Xtream variants and HTTPS-bridged direct playback so video & audio & seek all work!
-      if (isStaticDeploy) {
+      if (normalizedChannel.forceProxy || normalizedChannel.isProxied) {
+        pushAttempt('native', proxyUrl);
+        pushAttempt('native', transcodeFullUrl);
+      } else if (isStaticDeploy) {
         if (xtreamAltUrls.vodMp4Url) {
           for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url, true)) {
             pushAttempt('native', safeMp4, true);
@@ -592,20 +689,29 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       // Standard VOD (.mp4, .webm, .mov, /movie/, /series/, /vod/, Archive.org, Google Drive, Dropbox, Pixeldrain):
       const isGoogleDriveVod = /drive\.usercontent\.google\.com|drive\.google\.com/i.test(cleanUrl);
       const preferProxyFirst =
-        canUseBackendProxy() &&
-        (isGoogleDriveVod ||
-          Boolean(normalizedChannel.referer) ||
-          hasMacAuth ||
-          (!isHttpsUrl && isPageHttps));
+        normalizedChannel.forceProxy ||
+        normalizedChannel.isProxied ||
+        (canUseBackendProxy() &&
+          (isGoogleDriveVod ||
+            Boolean(normalizedChannel.referer) ||
+            hasMacAuth ||
+            (!isHttpsUrl && isPageHttps)));
 
-      if (!preferProxyFirst && (isHttpsUrl || !isPageHttps || isStaticDeploy) && !hasMacAuth) {
+      if (preferProxyFirst) {
+        pushAttempt('native', proxyUrl);
         for (const safeUrl of httpsSafeCleanUrls) {
           pushAttempt('native', safeUrl, true);
         }
-      }
-      pushAttempt('native', proxyUrl);
-      for (const safeUrl of httpsSafeCleanUrls) {
-        pushAttempt('native', safeUrl, true);
+      } else {
+        if ((isHttpsUrl || !isPageHttps || isStaticDeploy) && !hasMacAuth) {
+          for (const safeUrl of httpsSafeCleanUrls) {
+            pushAttempt('native', safeUrl, true);
+          }
+        }
+        pushAttempt('native', proxyUrl);
+        for (const safeUrl of httpsSafeCleanUrls) {
+          pushAttempt('native', safeUrl, true);
+        }
       }
       if (xtreamAltUrls.vodMp4Url && xtreamAltUrls.vodMp4Url !== cleanUrl) {
         for (const safeMp4 of getHttpsSafeMediaUrls(xtreamAltUrls.vodMp4Url, true)) {
@@ -1047,6 +1153,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       while (
         nextIdx < attempts.length &&
         !canUseBackendProxy() &&
+        !normalizedChannel.forceProxy &&
         (attempts[nextIdx].url.includes('/api/proxy') ||
           attempts[nextIdx].url.includes('/api/transcode'))
       ) {
@@ -1104,6 +1211,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
           while (
             firstValidIdx < attempts.length &&
             !canUseBackendProxy() &&
+            !normalizedChannel.forceProxy &&
             (attempts[firstValidIdx].url.includes('/api/proxy') ||
               attempts[firstValidIdx].url.includes('/api/transcode'))
           ) {
@@ -1780,6 +1888,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
           while (
             firstValidIdx < attempts.length &&
             !canUseBackendProxy() &&
+            !normalizedChannel.forceProxy &&
             (attempts[firstValidIdx].url.includes('/api/proxy') ||
               attempts[firstValidIdx].url.includes('/api/transcode'))
           ) {
@@ -1929,6 +2038,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       while (
         firstIdx < attempts.length &&
         !canUseBackendProxy() &&
+        !normalizedChannel.forceProxy &&
         (attempts[firstIdx].url.includes('/api/proxy') ||
           attempts[firstIdx].url.includes('/api/transcode'))
       ) {
@@ -2012,10 +2122,42 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     onSelectChannel(channels[nextIdx]);
   };
 
-  const handleRotateOrAspect = () => {
-    setAspectMode((prev) =>
-      prev === 'fill' ? 'contain' : prev === 'contain' ? 'cover' : 'fill'
-    );
+  const handleToggleRotation = async (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+
+    // 1. Ensure fullscreen is active so mobile header and navigation buttons stay hidden
+    await requestFullscreenSafe();
+
+    // 2. Toggle target orientation between Vertical and Horizontal
+    const nextLandscape = !isLandscape;
+    setIsLandscape(nextLandscape);
+
+    // 3. Modern Screen Orientation API (Android Chrome, WebViews, etc.)
+    try {
+      const orientation =
+        screen.orientation ||
+        (screen as any).mozOrientation ||
+        (screen as any).msOrientation;
+      if (orientation && typeof orientation.lock === 'function') {
+        if (nextLandscape) {
+          await orientation.lock('landscape');
+        } else {
+          await orientation.lock('portrait');
+        }
+      }
+    } catch {
+      // Screen orientation lock may throw if device sensor is locked or on iOS/desktop without sensor.
+      // CSS rotation fallback below smoothly handles visual rotation in those cases!
+    }
+
+    // 4. On-screen HUD toast feedback
+    setRotationHudText(nextLandscape ? 'Horizontal (Landscape)' : 'Vertical (Portrait)');
+    if (gestureHudTimeoutRef.current) {
+      window.clearTimeout(gestureHudTimeoutRef.current);
+    }
+    gestureHudTimeoutRef.current = window.setTimeout(() => {
+      setRotationHudText(null);
+    }, 1300);
   };
 
   useEffect(() => {
@@ -2027,6 +2169,14 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
   }, []);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    // If not in fullscreen, request fullscreen on mobile tap
+    if (
+      typeof document !== 'undefined' &&
+      !document.fullscreenElement &&
+      !(document as any).webkitFullscreenElement
+    ) {
+      requestFullscreenSafe();
+    }
     if (
       showChannelDrawer ||
       showPlayerSettings ||
@@ -2122,6 +2272,29 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       ? Math.min(100, Math.max(0, (effectiveDisplayTime / duration) * 100))
       : 0;
 
+  const handleClosePlayer = () => {
+    exitFullscreenSafe();
+    onClose();
+  };
+
+  const needCssRotation = isLandscape !== isPhysicalLandscape;
+  const videoComputedStyle: React.CSSProperties = needCssRotation
+    ? {
+        position: 'absolute',
+        top: '50%',
+        left: '50%',
+        width: '100vh',
+        height: '100vw',
+        maxWidth: 'none',
+        maxHeight: 'none',
+        transform: `translate(-50%, -50%) rotate(${!isPhysicalLandscape ? '90deg' : '-90deg'}) ${
+          videoScale !== 100 ? `scale(${videoScale / 100})` : ''
+        }`,
+      }
+    : videoScale !== 100
+    ? { transform: `scale(${videoScale / 100})` }
+    : {};
+
   return (
     <div
       ref={containerRef}
@@ -2141,12 +2314,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
       {/* HTML5 Video Element (kept free of CSS filter so hardware video overlays never black out) */}
       <video
         ref={videoRef}
-        style={
-          videoScale !== 100
-            ? { transform: `scale(${videoScale / 100})` }
-            : undefined
-        }
-        className={`absolute inset-0 w-full h-full transition-transform duration-75 ${
+        style={videoComputedStyle}
+        className={`transition-all duration-200 ${
+          needCssRotation ? '' : 'absolute inset-0 w-full h-full'
+        } ${
           aspectRatioIdx === 3
             ? 'object-fill'
             : aspectRatioIdx === 1 || aspectRatioIdx === 2
@@ -2221,7 +2392,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
         {/* Row 1: Top Action Bar */}
         <div className="h-14 px-2 flex items-center justify-between">
           <button
-            onClick={onClose}
+            onClick={handleClosePlayer}
             className="w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
             aria-label="Back"
           >
@@ -2395,15 +2566,16 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
             </svg>
           </button>
 
-          {/* 5. Screen Rotation / Aspect Mode Icon */}
+          {/* 5. Screen Rotation Button (Toggles Vertical & Horizontal) */}
           <button
-            onClick={handleRotateOrAspect}
-            className="w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
-            aria-label="Rotate or change aspect ratio"
+            onClick={handleToggleRotation}
+            className="w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors cursor-pointer"
+            aria-label={isLandscape ? 'Switch to Vertical (Portrait)' : 'Switch to Horizontal (Landscape)'}
+            title={isLandscape ? 'Switch to Vertical (Portrait)' : 'Switch to Horizontal (Landscape)'}
           >
             <svg
               viewBox="0 0 24 24"
-              className="w-6 h-6 fill-current drop-shadow"
+              className="w-6 h-6 fill-current drop-shadow transition-transform duration-200"
               aria-hidden="true"
             >
               <path d="M16.48 2.52c3.27 1.55 5.61 4.72 5.97 8.48h1.5C23.44 4.84 18.29 0 12 0l-.66.03 3.81 3.81 1.33-1.32zm-6.25-.77c-.59-.59-1.54-.59-2.12 0L1.75 8.11c-.59.59-.59 1.54 0 2.12l12.02 12.02c.59.59 1.54.59 2.12 0l6.36-6.36c.59-.59.59-1.54 0-2.12L10.23 1.75zm4.6 19.44L2.81 9.17l6.36-6.36 12.02 12.02-6.36 6.36zm-7.31.29C4.25 19.94 1.91 16.76 1.55 13H.05C.56 19.16 5.71 24 12 24l.66-.03-3.81-3.81-1.33 1.32z" />
@@ -2565,6 +2737,20 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
                 {gestureHud === 'brightness' ? `${brightness}%` : `${volume}%`}
               </span>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Center Rotation HUD Overlay */}
+      {rotationHudText !== null && (
+        <div className="fixed inset-0 z-30 flex items-center justify-center pointer-events-none">
+          <div className="bg-black/75 backdrop-blur-sm rounded-[4px] px-5 py-3 flex items-center gap-3.5 shadow-[0_4px_16px_rgba(0,0,0,0.65)] border border-white/10">
+            <svg viewBox="0 0 24 24" className="w-7 h-7 fill-[#5BAAF5] shrink-0">
+              <path d="M16.48 2.52c3.27 1.55 5.61 4.72 5.97 8.48h1.5C23.44 4.84 18.29 0 12 0l-.66.03 3.81 3.81 1.33-1.32zm-6.25-.77c-.59-.59-1.54-.59-2.12 0L1.75 8.11c-.59.59-.59 1.54 0 2.12l12.02 12.02c.59.59 1.54.59 2.12 0l6.36-6.36c.59-.59.59-1.54 0-2.12L10.23 1.75zm4.6 19.44L2.81 9.17l6.36-6.36 12.02 12.02-6.36 6.36zm-7.31.29C4.25 19.94 1.91 16.76 1.55 13H.05C.56 19.16 5.71 24 12 24l.66-.03-3.81-3.81-1.33 1.32z" />
+            </svg>
+            <span className="text-[17px] font-medium text-white tracking-wide">
+              {rotationHudText}
+            </span>
           </div>
         </div>
       )}

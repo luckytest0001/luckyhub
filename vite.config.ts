@@ -8,7 +8,11 @@ const SOURCE_INDEX_HTML = `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#000000" />
     <meta name="referrer" content="no-referrer" />
     <title>IPTV Player</title>
     <meta name="description" content="Material Design IPTV player supporting M3U and XSPF playlists with live HLS channel streaming, category groups, and favorites." />

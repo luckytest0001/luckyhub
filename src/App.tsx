@@ -35,6 +35,8 @@ import {
   ensureBackendProbed,
   fetchWithUniversalFallback,
   getEffectiveApiBaseUrl,
+  isDirectVodChannel,
+  buildChannelProxyUrl,
 } from './utils/proxyHelper';
 
 type ScreenMode =
@@ -258,6 +260,81 @@ export default function App() {
   const [moreMenuSortSubmenu, setMoreMenuSortSubmenu] = useState(false);
   const [parentalHideLocked, setParentalHideLocked] = useState(false);
   const [parentalAutolock, setParentalAutolock] = useState(true);
+  const [backendProxyUrl, setBackendProxyUrl] = useState<string>(() => {
+    try {
+      return localStorage.getItem('iptv_backend_proxy_url') || '';
+    } catch {
+      return '';
+    }
+  });
+
+  // Storage Permission Dialog states
+  const [storagePermissionGranted, setStoragePermissionGranted] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('iptv_storage_permission') === 'granted';
+    } catch {
+      return false;
+    }
+  });
+  const [showStoragePermissionModal, setShowStoragePermissionModal] = useState(false);
+  const [prevScreenBeforeFilePicker, setPrevScreenBeforeFilePicker] =
+    useState<ScreenMode>('playlists');
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const urlInputRef = useRef<HTMLInputElement | null>(null);
+  const categoryContentRef = useRef<HTMLDivElement | null>(null);
+
+  const triggerMobileStoragePicker = () => {
+    try {
+      const input =
+        fileInputRef.current ||
+        (document.getElementById('iptv-file-input') as HTMLInputElement | null);
+      if (input) {
+        input.value = '';
+        input.click();
+      } else {
+        const tempInput = document.createElement('input');
+        tempInput.type = 'file';
+        tempInput.style.position = 'fixed';
+        tempInput.style.left = '-9999px';
+        tempInput.style.opacity = '0';
+        tempInput.onchange = (e) => {
+          handleFileChange(e as unknown as React.ChangeEvent<HTMLInputElement>);
+          try {
+            document.body.removeChild(tempInput);
+          } catch {
+            // ignore
+          }
+        };
+        document.body.appendChild(tempInput);
+        tempInput.click();
+      }
+    } catch (err) {
+      console.error('Failed to trigger mobile storage picker:', err);
+    }
+  };
+
+  const handleAllowStorage = () => {
+    setStoragePermissionGranted(true);
+    setShowStoragePermissionModal(false);
+    try {
+      localStorage.setItem('iptv_storage_permission', 'granted');
+    } catch {
+      // ignore
+    }
+    // Directly trigger native mobile file manager to pick files
+    triggerMobileStoragePicker();
+  };
+
+  const handleSelectFileClick = () => {
+    setModalMode(null);
+    setDrawerOpen(false);
+    triggerMobileStoragePicker();
+  };
+
+  const openFilePickerScreen = () => {
+    handleSelectFileClick();
+  };
 
   // Storage Permission Dialog states
   const [storagePermissionGranted, setStoragePermissionGranted] = useState<boolean>(() => {
@@ -431,6 +508,42 @@ export default function App() {
       openExternalChannelLink(ch.url);
       return;
     }
+
+    // Automatically open in true fullscreen on mobile to hide browser header and navigation buttons
+    try {
+      if (
+        typeof document !== 'undefined' &&
+        !document.fullscreenElement &&
+        !(document as any).webkitFullscreenElement
+      ) {
+        const el = document.documentElement;
+        if (el.requestFullscreen) {
+          el.requestFullscreen({ navigationUI: 'hide' } as any).catch(() => {});
+        } else if ((el as any).webkitRequestFullscreen) {
+          (el as any).webkitRequestFullscreen();
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    // Force all direct VOD URLs (mp4/mkv/avi/webm/mov/etc) through the proxy server.
+    // This bypasses CORS and Mixed Content issues on GitHub Pages by ensuring the proxy
+    // fetches the media segments instead of the browser.
+    if (isDirectVodChannel(ch)) {
+      const activeUa = vpHttpUserAgent.trim() || DEFAULT_PLAYER_USER_AGENT;
+      const proxyUrl = buildChannelProxyUrl(ch, activeUa);
+      const proxiedChannel: Channel = {
+        ...ch,
+        originalUrl: ch.originalUrl || ch.url,
+        url: proxyUrl,
+        forceProxy: true,
+        isProxied: true,
+      };
+      setPlayingChannel(proxiedChannel);
+      return;
+    }
+
     setPlayingChannel(ch);
   };
 
@@ -3202,7 +3315,7 @@ export default function App() {
             SCREEN: PROXY SETTINGS (Exact Match to Screenshot_20261009-212910_IPTV.jpg & Screenshot_20261009-213321_IPTV.jpg)
            ------------------------------------------------------------------- */}
         {screen === 'proxy_settings' && (
-          <div className="flex-1 flex flex-col items-center justify-center px-5 text-center">
+          <div className="flex-1 flex flex-col items-center justify-start overflow-y-auto px-5 py-6 text-center">
             <p className="text-[#B5B5B5] text-[14.5px] font-normal leading-[1.45] max-w-[96%]">
               Many Android devices can&apos;t receive UDP multicast streams, it&apos;s recommended to use UDP proxy in order to watch such streams. Even if your device supports multicast, you can get more stable and clear picture with UDP proxy. Please install proxy somewhere in your LAN and provide it&apos;s connection parameters here.
             </p>
@@ -3226,6 +3339,56 @@ export default function App() {
                 </span>
               </button>
             )}
+
+            {/* Web & VOD Streaming Proxy (Essential for GitHub Pages CORS bypass) */}
+            <div className="mt-8 w-full max-w-lg bg-[#2D2D2D] rounded-[4px] p-4 text-left border border-white/10 shadow-md">
+              <div className="flex items-center justify-between mb-1.5">
+                <h3 className="text-white text-[15px] font-medium tracking-wide">
+                  Backend & VOD Streaming Proxy
+                </h3>
+                <span className="text-[11px] px-2 py-0.5 rounded bg-[#1E4B7A] text-[#5BAAF5] font-semibold uppercase tracking-wider">
+                  GitHub Pages CORS
+                </span>
+              </div>
+              <p className="text-[#B5B5B5] text-[12.5px] leading-relaxed mb-3">
+                When deploying as a static site on GitHub Pages, direct VOD streams (MP4/MKV/AVI/WebM) are routed through this proxy server to fetch media segments and bypass browser CORS restrictions.
+              </p>
+              <div className="flex items-center gap-2">
+                <input
+                  type="url"
+                  value={backendProxyUrl}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setBackendProxyUrl(val);
+                  }}
+                  placeholder={getEffectiveApiBaseUrl() || 'https://your-proxy-domain.com'}
+                  className="flex-1 bg-[#1E1E1E] text-white text-[13.5px] px-3 py-2 rounded-[2px] border border-white/20 focus:border-[#5BAAF5] outline-none caret-[#5BAAF5]"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    try {
+                      const trimmed = backendProxyUrl.trim();
+                      if (trimmed) {
+                        localStorage.setItem('iptv_backend_proxy_url', trimmed);
+                        showToast('Proxy server URL saved');
+                      } else {
+                        localStorage.removeItem('iptv_backend_proxy_url');
+                        showToast('Reset to default proxy');
+                      }
+                    } catch {
+                      showToast('Could not save proxy');
+                    }
+                  }}
+                  className="px-3.5 py-2 bg-[#5BAAF5] hover:bg-[#4698e6] text-[#1E1E1E] text-[13px] font-semibold rounded-[2px] transition-colors uppercase tracking-wider"
+                >
+                  Save
+                </button>
+              </div>
+              <p className="mt-2 text-[11px] text-[#888888]">
+                Current active server: <span className="text-[#CCCCCC] font-mono">{getEffectiveApiBaseUrl() || '(Same-origin /api/proxy)'}</span>
+              </p>
+            </div>
           </div>
         )}
 

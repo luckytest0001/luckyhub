@@ -4,6 +4,8 @@
  * AND when deployed as a static site on GitHub Pages (*.github.io), Vercel, Netlify, or custom domains.
  */
 
+import type { Channel } from './playlistParser';
+
 const REMOTE_BACKEND_FALLBACK_URLS = [
   (import.meta as unknown as { env?: Record<string, string> })?.env?.VITE_API_BASE_URL || '',
   'https://ais-pre-xns2pdyjf3mio652yewbjq-960474134103.asia-southeast1.run.app',
@@ -16,20 +18,28 @@ let probePromise: Promise<string | null> | null = null;
 let probeFinished = false;
 
 /**
- * Reads any user-configured proxy host from localStorage (`iptv_proxy_settings_v1`)
+ * Reads any user-configured proxy host from localStorage (`iptv_backend_proxy_url` or `iptv_proxy_settings_v1`)
  * if it looks like a full HTTP/HTTPS backend URL.
  */
-function getCustomConfiguredBackendUrl(): string | null {
+export function getCustomConfiguredBackendUrl(): string | null {
   if (typeof window === 'undefined') return null;
   try {
+    // 1. Check direct backend proxy URL setting
+    const directUrl = window.localStorage.getItem('iptv_backend_proxy_url');
+    if (directUrl && /^https?:\/\//i.test(directUrl.trim())) {
+      return directUrl.trim().replace(/\/+$/, '');
+    }
+
+    // 2. Check structured proxy settings
     const raw = window.localStorage.getItem('iptv_proxy_settings_v1');
     if (!raw) return null;
     const parsed = JSON.parse(raw) as { enabled?: boolean; host?: string; port?: string };
     if (parsed?.enabled && parsed.host) {
-      const h = parsed.host.trim();
-      if (/^https?:\/\//i.test(h)) {
-        return h.replace(/\/+$/, '');
+      let h = parsed.host.trim();
+      if (!/^https?:\/\//i.test(h)) {
+        h = `http://${h}${parsed.port ? `:${parsed.port}` : ''}`;
       }
+      return h.replace(/\/+$/, '');
     }
   } catch {
     // ignore
@@ -119,6 +129,11 @@ export async function ensureBackendProbed(): Promise<string | null> {
     if (envApiUrl && !candidates.includes(envApiUrl)) {
       candidates.push(envApiUrl);
     }
+    for (const remoteUrl of REMOTE_BACKEND_FALLBACK_URLS) {
+      if (remoteUrl && !candidates.includes(remoteUrl)) {
+        candidates.push(remoteUrl);
+      }
+    }
     if (!isStaticHostEnvironment()) {
       candidates.push('');
     }
@@ -133,10 +148,17 @@ export async function ensureBackendProbed(): Promise<string | null> {
       }
     }
 
-    backendAvailable = false;
-    resolvedApiBaseUrl = null;
+    // On static deployments (e.g. GitHub Pages), if no probe succeeded yet, default to first candidate
+    // so proxy requests don't fall back to relative /api/proxy which 404s on static hosting.
+    if (candidates.length > 0) {
+      resolvedApiBaseUrl = candidates[0];
+    } else {
+      resolvedApiBaseUrl = null;
+    }
+
+    backendAvailable = resolvedApiBaseUrl !== null && resolvedApiBaseUrl !== '';
     probeFinished = true;
-    return null;
+    return resolvedApiBaseUrl;
   })();
 
   return probePromise;
@@ -149,7 +171,7 @@ if (typeof window !== 'undefined') {
 
 /**
  * Synchronously returns the best known API base URL (`""` on full-stack host,
- * or custom backend URL on static hosts).
+ * or custom/remote backend URL on static hosts).
  */
 export function getEffectiveApiBaseUrl(): string {
   if (resolvedApiBaseUrl !== null) {
@@ -159,17 +181,148 @@ export function getEffectiveApiBaseUrl(): string {
   if (customBackend) {
     return customBackend;
   }
+  const envApiUrl = (
+    (import.meta as unknown as { env?: Record<string, string> })?.env?.VITE_API_BASE_URL || ''
+  )
+    .trim()
+    .replace(/\/+$/, '');
+  if (envApiUrl) {
+    return envApiUrl;
+  }
+  for (const remoteUrl of REMOTE_BACKEND_FALLBACK_URLS) {
+    if (remoteUrl) return remoteUrl;
+  }
   return '';
 }
 
 /**
- * Returns whether the backend proxy/transcode server has been verified available.
- * Never returns true on static hosts unless a remote backend explicitly passed the health check.
+ * Returns whether the backend proxy/transcode server can be used.
+ * Returns true if a backend URL is configured, detected, or available.
  */
 export function canUseBackendProxy(): boolean {
   if (backendAvailable) return true;
-  if (probeFinished) return false;
+  const base = getEffectiveApiBaseUrl();
+  if (base && /^https?:\/\//i.test(base)) {
+    return true;
+  }
+  if (probeFinished && isStaticHostEnvironment() && !base) return false;
   return !isStaticHostEnvironment();
+}
+
+/**
+ * Detects whether a channel is a direct VOD URL (MP4, MKV, AVI, WebM, MOV, /movie/, /series/, /vod/, Pixeldrain, etc.)
+ * that needs to be routed through the proxy server to avoid browser CORS and Mixed Content issues on GitHub Pages.
+ */
+export function isDirectVodChannel(
+  channel:
+    | Channel
+    | {
+        url?: string;
+        group?: string;
+        xtreamParams?: { streamType?: string };
+        forceProxy?: boolean;
+        isProxied?: boolean;
+      }
+): boolean {
+  if (!channel || !channel.url) return false;
+  if (channel.forceProxy || channel.isProxied) return true;
+
+  const cleanUrl = channel.url.trim().toLowerCase();
+
+  // If already proxied
+  if (cleanUrl.includes('/api/proxy?') || cleanUrl.includes('api.cors.lol') || cleanUrl.includes('corsproxy.io')) {
+    return true;
+  }
+
+  // Direct VOD media container extensions
+  if (/\.(mp4|mkv|avi|webm|mov|m4v|flv|wmv|3gp|mpg|mpeg|divx|ogv)(\?|$|#|&)/i.test(cleanUrl)) {
+    return true;
+  }
+
+  // Common IPTV VOD path segments
+  if (/\/(movie|series|vod)\//i.test(cleanUrl)) {
+    return true;
+  }
+
+  // VOD hosting services and cloud drives
+  if (
+    /pixeldrain\.(com|dev)|archive\.org|drive\.usercontent\.google\.com|drive\.google\.com|dropbox\.com|dropboxusercontent\.com|1fichier\.com|mega\.nz/i.test(
+      cleanUrl
+    )
+  ) {
+    return true;
+  }
+
+  // Xtream streamType
+  if (channel.xtreamParams?.streamType === 'movie' || channel.xtreamParams?.streamType === 'series') {
+    return true;
+  }
+
+  // Group name hint for VOD (e.g. "VOD Movies", "Series") unless it's an HLS live stream
+  const group = (channel.group || '').toLowerCase();
+  if (
+    (group.includes('vod') ||
+      group.includes('movie') ||
+      group.includes('movies') ||
+      group.includes('series') ||
+      group.includes('cinema') ||
+      group.includes('film')) &&
+    !/\.m3u8(\?|$|#|&)/i.test(cleanUrl)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Builds the proxy streaming URL for any channel.
+ * Routes through the active backend / proxy server with authenticated query parameters.
+ */
+export function buildChannelProxyUrl(
+  channel: Channel,
+  fallbackUa?: string,
+  overrideTargetUrl?: string,
+  baseUrlOverride?: string
+): string {
+  const targetUrl = (overrideTargetUrl || channel.originalUrl || channel.url || '').trim();
+
+  // If targetUrl is already a complete proxy URL, avoid double-wrapping
+  if (targetUrl.includes('/api/proxy?')) {
+    return targetUrl;
+  }
+
+  const base = baseUrlOverride !== undefined ? baseUrlOverride : getEffectiveApiBaseUrl();
+
+  let qs = `url=${encodeURIComponent(targetUrl)}`;
+  const effectiveUa = (channel.userAgent || fallbackUa || '').trim();
+  if (effectiveUa) {
+    qs += `&ua=${encodeURIComponent(effectiveUa)}`;
+  }
+  if (channel.referer) {
+    qs += `&referer=${encodeURIComponent(channel.referer)}`;
+  }
+  if (channel.cookie) {
+    qs += `&cookie=${encodeURIComponent(channel.cookie)}`;
+  }
+  if (channel.macAddress) {
+    qs += `&mac=${encodeURIComponent(channel.macAddress)}`;
+  }
+  if (channel.authToken) {
+    qs += `&auth=${encodeURIComponent(channel.authToken)}`;
+  }
+  if (channel.xtreamParams) {
+    qs += `&xtreamServer=${encodeURIComponent(channel.xtreamParams.server)}`;
+    qs += `&xtreamUser=${encodeURIComponent(channel.xtreamParams.username)}`;
+    qs += `&xtreamPass=${encodeURIComponent(channel.xtreamParams.password)}`;
+    qs += `&xtreamStreamId=${encodeURIComponent(channel.xtreamParams.streamId)}`;
+    qs += `&xtreamType=${encodeURIComponent(channel.xtreamParams.streamType)}`;
+  }
+  if (channel.name) {
+    qs += `&title=${encodeURIComponent(channel.name)}`;
+  }
+
+  return `${base}/api/proxy?${qs}`;
 }
 
 /**

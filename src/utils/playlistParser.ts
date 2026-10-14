@@ -25,6 +25,9 @@ export interface Channel {
   authToken?: string;
   xtreamParams?: XtreamStreamParams;
   number: number;
+  forceProxy?: boolean;
+  isProxied?: boolean;
+  originalUrl?: string;
 }
 
 export interface Playlist {
