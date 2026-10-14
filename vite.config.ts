@@ -44,7 +44,9 @@ function githubPagesRootSyncPlugin(): Plugin {
     },
     closeBundle() {
       try {
-        const rootDir = path.resolve(__dirname, '.');
+        const rootDir = typeof import.meta !== 'undefined' && (import.meta as any).dirname
+          ? (import.meta as any).dirname
+          : path.resolve('.');
         const distAssetsDir = path.join(rootDir, 'dist', 'assets');
         const rootAssetsDir = path.join(rootDir, 'assets');
         const distIndexHtml = path.join(rootDir, 'dist', 'index.html');
@@ -68,6 +70,21 @@ function githubPagesRootSyncPlugin(): Plugin {
         }
         if (fs.existsSync(distIndexHtml)) {
           fs.copyFileSync(distIndexHtml, rootIndexHtml);
+          // Also generate 404.html for GitHub Pages SPA routing fallback
+          const dist404Html = path.join(rootDir, 'dist', '404.html');
+          const root404Html = path.join(rootDir, '404.html');
+          if (!fs.existsSync(dist404Html)) {
+            fs.copyFileSync(distIndexHtml, dist404Html);
+          }
+          if (fs.existsSync(dist404Html)) {
+            fs.copyFileSync(dist404Html, root404Html);
+          }
+        }
+        // Copy .nojekyll to dist and root so GitHub Pages Jekyll does not ignore assets
+        const publicNoJekyll = path.join(rootDir, 'public', '.nojekyll');
+        if (fs.existsSync(publicNoJekyll)) {
+          fs.copyFileSync(publicNoJekyll, path.join(rootDir, 'dist', '.nojekyll'));
+          fs.copyFileSync(publicNoJekyll, path.join(rootDir, '.nojekyll'));
         }
       } catch {
         // ignore sync errors
@@ -77,20 +94,24 @@ function githubPagesRootSyncPlugin(): Plugin {
 }
 
 export default defineConfig(({command}) => {
+  const rootDir = typeof import.meta !== 'undefined' && (import.meta as any).dirname
+    ? (import.meta as any).dirname
+    : path.resolve('.');
+
   if (command === 'build') {
     try {
-      const rootIndexHtml = path.resolve(__dirname, 'index.html');
+      const rootIndexHtml = path.resolve(rootDir, 'index.html');
       fs.writeFileSync(rootIndexHtml, SOURCE_INDEX_HTML, 'utf8');
     } catch {
       // ignore
     }
   }
   return {
-    base: './',
+    base: process.env.VITE_BASE_PATH || './',
     plugins: [githubPagesRootSyncPlugin(), react(), tailwindcss()],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(rootDir, '.'),
       },
     },
     server: {

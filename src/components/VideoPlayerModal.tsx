@@ -30,6 +30,10 @@ import {
   ClientTranscodeResult,
   transcodeChannelClientSide,
 } from '../utils/clientFfmpegTranscoder';
+import {
+  parseRemoteKeyEvent,
+  focusTvElement,
+} from '../utils/tvNavigation';
 
 interface VideoPlayerModalProps {
   channel: Channel;
@@ -2168,6 +2172,186 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     };
   }, []);
 
+  // Autofocus active channel in left drawer when opened on Android TV
+  useEffect(() => {
+    if (showChannelDrawer) {
+      const timer = window.setTimeout(() => {
+        if (activeDrawerItemRef.current) {
+          focusTvElement(activeDrawerItemRef.current, true);
+        } else {
+          const firstDrawerItem = document.querySelector<HTMLElement>('[data-tv="drawer-channel"]');
+          if (firstDrawerItem) {
+            focusTvElement(firstDrawerItem, true);
+          }
+        }
+      }, 50);
+      return () => window.clearTimeout(timer);
+    }
+  }, [showChannelDrawer]);
+
+  // Android TV Remote & D-Pad Keyboard Handler for Video Player
+  useEffect(() => {
+    const handlePlayerRemoteKeyDown = (e: KeyboardEvent) => {
+      const {
+        isUp,
+        isDown,
+        isLeft,
+        isRight,
+        isSelect,
+        isBack,
+        isChannelUp,
+        isChannelDown,
+        isPlayPause,
+        isRewind,
+        isFastForward,
+      } = parseRemoteKeyEvent(e);
+
+      // 1. If translucent channel drawer is open:
+      if (showChannelDrawer) {
+        if (isBack) {
+          e.preventDefault();
+          e.stopPropagation();
+          setShowChannelDrawer(false);
+          return;
+        }
+        // Let D-pad up/down navigate rows in drawer
+        return;
+      }
+
+      // 2. If sub-modals are open (settings, more menu):
+      if (showPlayerSettings || showMoreMenu) {
+        if (isBack) {
+          e.preventDefault();
+          e.stopPropagation();
+          setShowPlayerSettings(false);
+          setShowMoreMenu(false);
+          return;
+        }
+        return;
+      }
+
+      // 3. Remote Back button: close player and return to channel list
+      if (isBack) {
+        e.preventDefault();
+        e.stopPropagation();
+        handleClosePlayer();
+        return;
+      }
+
+      // 4. Play/Pause toggle
+      if (isPlayPause) {
+        e.preventDefault();
+        e.stopPropagation();
+        togglePlay();
+        setShowControls(true);
+        return;
+      }
+
+      // 5. Channel Up / Down
+      if (isChannelUp) {
+        e.preventDefault();
+        e.stopPropagation();
+        handleNextChannel();
+        setShowControls(true);
+        return;
+      }
+      if (isChannelDown) {
+        e.preventDefault();
+        e.stopPropagation();
+        handlePrevChannel();
+        setShowControls(true);
+        return;
+      }
+
+      // 6. D-Pad Left / Rewind
+      if (isLeft || isRewind) {
+        e.preventDefault();
+        e.stopPropagation();
+        const effDuration = knownVodDurationRef.current || duration;
+        if (!isLiveStream && effDuration && effDuration > 0) {
+          // VOD Seek backward 10s
+          const newTime = Math.max(0, (currentTime || 0) - 10);
+          seekToTime(newTime);
+          setShowControls(true);
+        } else {
+          // Live stream: open translucent channel list
+          setDrawerCategory('All Channels');
+          setDrawerView('channels');
+          setShowChannelDrawer(true);
+        }
+        return;
+      }
+
+      // 7. D-Pad Right / FastForward
+      if (isRight || isFastForward) {
+        e.preventDefault();
+        e.stopPropagation();
+        const effDuration = knownVodDurationRef.current || duration;
+        if (!isLiveStream && effDuration && effDuration > 0) {
+          // VOD Seek forward 10s
+          const newTime = Math.min(effDuration, (currentTime || 0) + 10);
+          seekToTime(newTime);
+          setShowControls(true);
+        } else {
+          // Live stream: switch to next channel
+          handleNextChannel();
+          setShowControls(true);
+        }
+        return;
+      }
+
+      // 8. D-Pad Up: open translucent channel list (matching standard Android TV IPTV UX)
+      if (isUp) {
+        e.preventDefault();
+        e.stopPropagation();
+        setDrawerCategory('All Channels');
+        setDrawerView('channels');
+        setShowChannelDrawer(true);
+        return;
+      }
+
+      // 9. D-Pad Down: show controls or switch channel
+      if (isDown) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!showControls) {
+          setShowControls(true);
+        } else {
+          handleNextChannel();
+        }
+        return;
+      }
+
+      // 10. D-Pad Center / OK / Select:
+      if (isSelect) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!showControls) {
+          setShowControls(true);
+        } else {
+          togglePlay();
+        }
+        return;
+      }
+    };
+
+    window.addEventListener('keydown', handlePlayerRemoteKeyDown, { capture: true });
+    return () => {
+      window.removeEventListener('keydown', handlePlayerRemoteKeyDown, { capture: true });
+    };
+  }, [
+    showChannelDrawer,
+    showPlayerSettings,
+    showMoreMenu,
+    showControls,
+    isPlaying,
+    currentTime,
+    duration,
+    isLiveStream,
+    currentIndex,
+    channels.length,
+  ]);
+
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     // If not in fullscreen, request fullscreen on mobile tap
     if (
@@ -2798,7 +2982,7 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
             )}
 
             {/* Scrollable List */}
-            <div className="flex-1 overflow-y-auto no-scrollbar divide-y divide-white/[0.18]">
+            <div className="tv-scroll-container flex-1 overflow-y-auto no-scrollbar divide-y divide-white/[0.18]">
               {drawerView === 'channels'
                 ? drawerChannels.map((ch) => {
                     const isActive = ch.id === channel.id;
@@ -2807,16 +2991,32 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
                       <div
                         key={ch.id}
                         ref={isActive ? activeDrawerItemRef : null}
+                        tabIndex={0}
+                        role="button"
+                        data-tv="drawer-channel"
+                        data-channel-id={ch.id}
+                        onFocus={(e) => {
+                          focusTvElement(e.currentTarget, true);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === 'Select' || (e as any).keyCode === 23) {
+                            e.preventDefault();
+                            setDrawerCategory('All Channels');
+                            setDrawerView('channels');
+                            onSelectChannel(ch);
+                            setShowChannelDrawer(false);
+                          }
+                        }}
                         onClick={() => {
                           setDrawerCategory('All Channels');
                           setDrawerView('channels');
                           onSelectChannel(ch);
                           setShowChannelDrawer(false);
                         }}
-                        className={`relative h-[64px] px-1.5 flex items-center gap-2.5 cursor-pointer transition-colors ${
+                        className={`tv-focusable relative h-[64px] px-1.5 flex items-center gap-2.5 cursor-pointer transition-colors ${
                           isActive
-                            ? 'bg-[#3897D3]/75'
-                            : 'bg-transparent hover:bg-white/10'
+                            ? 'bg-[#3897D3]/85 ring-2 ring-white/60'
+                            : 'bg-transparent hover:bg-white/10 focus:bg-[#3897D3]/60 focus:ring-2 focus:ring-[#8AD0F8]'
                         }`}
                       >
                         {/* Square Poster / Logo */}
@@ -2869,14 +3069,27 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
                     return (
                       <div
                         key={cat}
+                        tabIndex={0}
+                        role="button"
+                        data-tv="drawer-category"
+                        onFocus={(e) => {
+                          focusTvElement(e.currentTarget, true);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === 'Select' || (e as any).keyCode === 23) {
+                            e.preventDefault();
+                            setDrawerCategory(cat);
+                            setDrawerView('channels');
+                          }
+                        }}
                         onClick={() => {
                           setDrawerCategory(cat);
                           setDrawerView('channels');
                         }}
-                        className={`h-[52px] px-3.5 flex items-center cursor-pointer transition-colors ${
+                        className={`tv-focusable h-[52px] px-3.5 flex items-center cursor-pointer transition-colors ${
                           isCatSelected
-                            ? 'bg-[#3897D3]/75'
-                            : 'bg-transparent hover:bg-white/10'
+                            ? 'bg-[#3897D3]/85 ring-2 ring-white/60'
+                            : 'bg-transparent hover:bg-white/10 focus:bg-[#3897D3]/60 focus:ring-2 focus:ring-[#8AD0F8]'
                         }`}
                       >
                         <span className="text-[14.5px] font-normal text-white truncate drop-shadow-[0_1px_2px_rgba(0,0,0,0.85)]">

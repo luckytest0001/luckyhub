@@ -9957,7 +9957,7 @@ export const INITIAL_YAARO_PLAYLIST: Playlist = {
   id: YAARO_PLAYLIST_ID,
   name: YAARO_PLAYLIST_NAME,
   sourceType: 'sample',
-  sourceUrl: '/yaaro_playlist.m3u',
+  sourceUrl: './yaaro_playlist.m3u',
   channels: YAARO_CHANNELS_DATA,
   addedAt: 1718000000000,
 };

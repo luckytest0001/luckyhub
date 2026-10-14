@@ -38,6 +38,11 @@ import {
   isDirectVodChannel,
   buildChannelProxyUrl,
 } from './utils/proxyHelper';
+import {
+  parseRemoteKeyEvent,
+  focusTvElement,
+  findNextSpatialElement,
+} from './utils/tvNavigation';
 
 type ScreenMode =
   | 'playlists'
@@ -460,6 +465,9 @@ export default function App() {
       // ignore
     }
 
+    // Record last played channel for TV focus restoration
+    lastPlayedChannelIdRef.current = ch.id;
+
     // Force all direct VOD URLs (mp4/mkv/avi/webm/mov/etc) through the proxy server.
     // This bypasses CORS and Mixed Content issues on GitHub Pages by ensuring the proxy
     // fetches the media segments instead of the browser.
@@ -479,6 +487,223 @@ export default function App() {
 
     setPlayingChannel(ch);
   };
+
+  const lastPlayedChannelIdRef = useRef<string | null>(null);
+
+  // Restore TV focus to the active channel when exiting video player
+  useEffect(() => {
+    if (!playingChannel && lastPlayedChannelIdRef.current) {
+      const channelId = lastPlayedChannelIdRef.current;
+      const timer = window.setTimeout(() => {
+        const el = document.querySelector<HTMLElement>(`[data-channel-id="${channelId}"]`);
+        if (el) {
+          focusTvElement(el, true);
+        }
+      }, 50);
+      return () => window.clearTimeout(timer);
+    }
+  }, [playingChannel]);
+
+  // Global Android TV D-Pad & Remote Navigation Handler
+  useEffect(() => {
+    const handleTvKeyDown = (e: KeyboardEvent) => {
+      // When video player is open, let player handle all remote keys
+      if (playingChannel) return;
+
+      const activeEl = document.activeElement as HTMLElement | null;
+      const isInput =
+        activeEl &&
+        (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA');
+
+      // If user is typing in an input, only allow Back/Escape and ArrowUp/Down to leave
+      if (
+        isInput &&
+        !['ArrowUp', 'ArrowDown', 'Escape'].includes(e.key) &&
+        e.keyCode !== 19 &&
+        e.keyCode !== 20 &&
+        e.keyCode !== 27
+      ) {
+        return;
+      }
+
+      const { isUp, isDown, isLeft, isRight, isSelect, isBack } = parseRemoteKeyEvent(e);
+
+      // Handle Back / Escape key
+      if (isBack) {
+        if (modalMode) {
+          e.preventDefault();
+          setModalMode(null);
+          return;
+        }
+        if (drawerOpen) {
+          e.preventDefault();
+          setDrawerOpen(false);
+          return;
+        }
+        if (showSearchBar && searchQuery) {
+          e.preventDefault();
+          setSearchQuery('');
+          return;
+        }
+        if (showSearchBar) {
+          e.preventDefault();
+          setShowSearchBar(false);
+          return;
+        }
+        if (screen !== 'channels' && screen !== 'playlists') {
+          e.preventDefault();
+          setScreen('channels');
+          return;
+        }
+        if (screen === 'channels' && playlists.length > 1) {
+          e.preventDefault();
+          setScreen('playlists');
+          return;
+        }
+      }
+
+      // If nothing is focused yet, or focus is on body, focus the first meaningful element
+      if (
+        (isUp || isDown || isLeft || isRight || isSelect) &&
+        (!activeEl || activeEl === document.body)
+      ) {
+        e.preventDefault();
+        const target =
+          document.querySelector<HTMLElement>('[data-tv="channel"]') ||
+          document.querySelector<HTMLElement>('[data-tv="category"]') ||
+          document.querySelector<HTMLElement>('[data-tv="tab"]');
+        if (target) {
+          focusTvElement(target, true);
+        }
+        return;
+      }
+
+      // Handle D-Pad Directions
+      if (isUp || isDown || isLeft || isRight) {
+        if (!activeEl) return;
+        const activeTv = activeEl.getAttribute('data-tv');
+
+        // From Tabs or Header to Content:
+        if (isDown && (activeTv === 'tab' || activeTv === 'header-btn')) {
+          e.preventDefault();
+          if (screen === 'channels') {
+            if (channelsTab === 'CATEGORIES') {
+              const catEl =
+                document.querySelector<HTMLElement>('[data-tv="category"][data-active="true"]') ||
+                document.querySelector<HTMLElement>('[data-tv="category"]');
+              if (catEl) {
+                focusTvElement(catEl, true);
+                return;
+              }
+            }
+            const firstCh = document.querySelector<HTMLElement>('[data-tv="channel"]');
+            if (firstCh) {
+              focusTvElement(firstCh, true);
+              return;
+            }
+          } else if (screen === 'playlists') {
+            const firstPl = document.querySelector<HTMLElement>('[data-tv="playlist"]');
+            if (firstPl) {
+              focusTvElement(firstPl, true);
+              return;
+            }
+          }
+        }
+
+        // From Category sidebar:
+        if (activeTv === 'category') {
+          if (isRight) {
+            e.preventDefault();
+            const firstCh =
+              categoryContentRef.current?.querySelector<HTMLElement>('[data-tv="channel"]') ||
+              document.querySelector<HTMLElement>('[data-tv="channel"]');
+            if (firstCh) {
+              focusTvElement(firstCh, true);
+              return;
+            }
+          }
+          if (isUp) {
+            const allCats = Array.from(document.querySelectorAll<HTMLElement>('[data-tv="category"]'));
+            if (allCats[0] === activeEl) {
+              e.preventDefault();
+              const catTab =
+                document.querySelector<HTMLElement>('[data-tv-tab="CATEGORIES"]') ||
+                document.querySelector<HTMLElement>('[data-tv="tab"]');
+              if (catTab) {
+                focusTvElement(catTab, true);
+                return;
+              }
+            }
+          }
+        }
+
+        // From Channel item:
+        if (activeTv === 'channel') {
+          if (isLeft && channelsTab === 'CATEGORIES') {
+            const activeRect = activeEl.getBoundingClientRect();
+            const allChs = Array.from(document.querySelectorAll<HTMLElement>('[data-tv="channel"]'));
+            const hasLeftCh = allChs.some((c) => {
+              if (c === activeEl) return false;
+              const r = c.getBoundingClientRect();
+              return r.right < activeRect.left + 5 && Math.abs(r.top - activeRect.top) < 35;
+            });
+            if (!hasLeftCh) {
+              e.preventDefault();
+              const catEl =
+                document.querySelector<HTMLElement>('[data-tv="category"][data-active="true"]') ||
+                document.querySelector<HTMLElement>('[data-tv="category"]');
+              if (catEl) {
+                focusTvElement(catEl, true);
+                return;
+              }
+            }
+          }
+
+          if (isUp) {
+            const activeRect = activeEl.getBoundingClientRect();
+            const allChs = Array.from(document.querySelectorAll<HTMLElement>('[data-tv="channel"]'));
+            const hasAboveCh = allChs.some((c) => {
+              if (c === activeEl) return false;
+              const r = c.getBoundingClientRect();
+              return r.bottom < activeRect.top + 5;
+            });
+            if (!hasAboveCh) {
+              e.preventDefault();
+              const activeTab =
+                document.querySelector<HTMLElement>(`[data-tv-tab="${channelsTab}"]`) ||
+                document.querySelector<HTMLElement>('[data-tv="tab"]');
+              if (activeTab) {
+                focusTvElement(activeTab, true);
+                return;
+              }
+            }
+          }
+        }
+
+        // 2D Spatial Navigation fallback for any other element
+        const dir = isUp ? 'up' : isDown ? 'down' : isLeft ? 'left' : 'right';
+        const next = findNextSpatialElement(activeEl, dir);
+        if (next) {
+          e.preventDefault();
+          focusTvElement(next, true);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleTvKeyDown, { capture: true });
+    return () => {
+      window.removeEventListener('keydown', handleTvKeyDown, { capture: true });
+    };
+  }, [
+    playingChannel,
+    screen,
+    channelsTab,
+    modalMode,
+    drawerOpen,
+    showSearchBar,
+    searchQuery,
+    playlists.length,
+  ]);
 
   // Submit Add URL Page (triggered by top-right checkmark ✓ or Enter key)
   const handleAddUrlPlaylist = async (e?: React.FormEvent) => {
@@ -1033,7 +1258,8 @@ export default function App() {
           <div className="flex items-center min-w-0 shrink-0">
             <button
               onClick={handleTopLeftIconClick}
-              className="w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors shrink-0"
+              data-tv="header-btn"
+              className="tv-focusable tv-nav-btn w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors shrink-0"
               aria-label={screen === 'channels' ? 'Menu' : 'Back'}
             >
               {screen === 'channels' ? (
@@ -1084,7 +1310,8 @@ export default function App() {
               <button
                 onClick={() => handleAddUrlPlaylist()}
                 disabled={isLoadingPlaylist}
-                className="w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 disabled:opacity-50 transition-colors"
+                data-tv="header-btn"
+                className="tv-focusable tv-nav-btn w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 disabled:opacity-50 transition-colors"
                 aria-label="Confirm Add URL"
               >
                 <Check className="w-6 h-6 stroke-[2]" />
@@ -1094,7 +1321,8 @@ export default function App() {
               <button
                 onClick={() => handleXtreamLogin()}
                 disabled={isLoadingPlaylist}
-                className="w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 disabled:opacity-50 transition-colors"
+                data-tv="header-btn"
+                className="tv-focusable tv-nav-btn w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 disabled:opacity-50 transition-colors"
                 aria-label="Confirm Xtream Login"
               >
                 <Check className="w-6 h-6 stroke-[2]" />
@@ -1108,7 +1336,8 @@ export default function App() {
                     setShowSearchBar((prev) => !prev);
                     if (showSearchBar) setSearchQuery('');
                   }}
-                  className="w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
+                  data-tv="header-btn"
+                  className="tv-focusable tv-nav-btn w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
                   title="Search"
                 >
                   {showSearchBar ? (
@@ -1121,7 +1350,8 @@ export default function App() {
                 {/* 2. 3x3 Grid / View Mode Switcher Icon */}
                 <button
                   onClick={() => setViewLayout((prev) => (prev === 'grid' ? 'list' : 'grid'))}
-                  className="w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
+                  data-tv="header-btn"
+                  className="tv-focusable tv-nav-btn w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
                   title="Change view mode"
                 >
                   {viewLayout === 'grid' ? (
@@ -1141,7 +1371,8 @@ export default function App() {
                 {/* 3. Cast Icon matching Screenshot 6 */}
                 <button
                   onClick={() => showToast('Searching for nearby Cast devices...')}
-                  className="w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
+                  data-tv="header-btn"
+                  className="tv-focusable tv-nav-btn w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
                   title="Cast to TV"
                 >
                   <svg
@@ -1159,7 +1390,8 @@ export default function App() {
                     setMoreMenuSortSubmenu(false);
                     setModalMode('more_menu');
                   }}
-                  className="w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
+                  data-tv="header-btn"
+                  className="tv-focusable tv-nav-btn w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
                   title="More options"
                 >
                   <MoreVertical className="w-[22px] h-[22px]" />
@@ -1172,7 +1404,8 @@ export default function App() {
                   setLoadError(null);
                   setModalMode('add_menu');
                 }}
-                className="w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
+                data-tv="header-btn"
+                className="tv-focusable tv-nav-btn w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
                 aria-label="Add playlist"
                 title="Add playlist"
               >
@@ -1185,7 +1418,8 @@ export default function App() {
                   onClick={() => {
                     setModalMode('epg_add_menu');
                   }}
-                  className="w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
+                  data-tv="header-btn"
+                  className="tv-focusable tv-nav-btn w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
                   aria-label="New EPG source"
                   title="New EPG source"
                 >
@@ -1195,7 +1429,8 @@ export default function App() {
                   onClick={() => {
                     setModalMode('epg_add_menu');
                   }}
-                  className="w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
+                  data-tv="header-btn"
+                  className="tv-focusable tv-nav-btn w-11 h-11 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
                   aria-label="More options"
                   title="More options"
                 >
@@ -1213,7 +1448,8 @@ export default function App() {
                   setUdpProxyTypeDropdownOpen(false);
                   setUdpProxyModalOpen(true);
                 }}
-                className="w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
+                data-tv="header-btn"
+                className="tv-focusable tv-nav-btn w-12 h-12 rounded-full flex items-center justify-center text-white hover:bg-white/10 active:bg-white/20 transition-colors"
                 aria-label="New UDP proxy"
                 title="New UDP proxy"
               >
@@ -1224,7 +1460,8 @@ export default function App() {
               <button
                 type="button"
                 onClick={triggerMobileStoragePicker}
-                className="h-9 px-2.5 sm:px-3 rounded bg-white/10 hover:bg-white/15 active:bg-white/20 flex items-center gap-1.5 cursor-pointer text-white transition-colors shrink-0"
+                data-tv="header-btn"
+                className="tv-focusable tv-nav-btn h-9 px-2.5 sm:px-3 rounded bg-white/10 hover:bg-white/15 active:bg-white/20 flex items-center gap-1.5 cursor-pointer text-white transition-colors shrink-0"
                 title="Open Mobile Storage"
               >
                 <Folder className="w-4 h-4 text-[#5BAAF5]" />
@@ -1241,12 +1478,14 @@ export default function App() {
         {screen === 'channels' && (
           <div className="grid grid-cols-3 bg-[#215387] text-center select-none">
             <button
+              data-tv="tab"
+              data-tv-tab="FAVORITES"
               onClick={() => {
                 setChannelsTab('FAVORITES');
               }}
-              className={`py-3 text-[13px] font-medium uppercase tracking-wide border-b-[3px] transition-colors ${
+              className={`tv-focusable tv-nav-btn py-3 text-[13px] font-medium uppercase tracking-wide border-b-[3px] transition-colors ${
                 channelsTab === 'FAVORITES'
-                  ? 'border-[#5BAAF5] text-white'
+                  ? 'border-[#5BAAF5] text-white bg-white/10'
                   : 'border-transparent text-white/75 hover:text-white'
               }`}
             >
@@ -1254,13 +1493,15 @@ export default function App() {
             </button>
 
             <button
+              data-tv="tab"
+              data-tv-tab="ALL_CHANNELS"
               onClick={() => {
                 setSelectedCategory(null);
                 setChannelsTab('ALL_CHANNELS');
               }}
-              className={`py-3 text-[13px] font-medium uppercase tracking-wide border-b-[3px] transition-colors ${
+              className={`tv-focusable tv-nav-btn py-3 text-[13px] font-medium uppercase tracking-wide border-b-[3px] transition-colors ${
                 channelsTab === 'ALL_CHANNELS'
-                  ? 'border-[#5BAAF5] text-white'
+                  ? 'border-[#5BAAF5] text-white bg-white/10'
                   : 'border-transparent text-white/75 hover:text-white'
               }`}
             >
@@ -1268,15 +1509,17 @@ export default function App() {
             </button>
 
             <button
+              data-tv="tab"
+              data-tv-tab="CATEGORIES"
               onClick={() => {
                 setChannelsTab('CATEGORIES');
                 if (!selectedCategory && categoryCounts.length > 0) {
                   setSelectedCategory(categoryCounts[0].name);
                 }
               }}
-              className={`py-3 text-[13px] font-medium uppercase tracking-wide border-b-[3px] transition-colors truncate px-2 ${
+              className={`tv-focusable tv-nav-btn py-3 text-[13px] font-medium uppercase tracking-wide border-b-[3px] transition-colors truncate px-2 ${
                 channelsTab === 'CATEGORIES'
-                  ? 'border-[#5BAAF5] text-white'
+                  ? 'border-[#5BAAF5] text-white bg-white/10'
                   : 'border-transparent text-white/75 hover:text-white'
               }`}
             >
@@ -1927,13 +2170,29 @@ export default function App() {
                     return (
                       <div
                         key={pl.id}
+                        tabIndex={0}
+                        role="button"
+                        data-tv="playlist"
+                        data-playlist-id={pl.id}
+                        onFocus={(e) => {
+                          focusTvElement(e.currentTarget, true);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === 'Select' || (e as any).keyCode === 23) {
+                            e.preventDefault();
+                            setActivePlaylistId(pl.id);
+                            setSelectedCategory(null);
+                            setChannelsTab('ALL_CHANNELS');
+                            setScreen('channels');
+                          }
+                        }}
                         onClick={() => {
                           setActivePlaylistId(pl.id);
                           setSelectedCategory(null);
                           setChannelsTab('ALL_CHANNELS');
                           setScreen('channels');
                         }}
-                        className="relative w-full flex items-center justify-between px-3 py-3 hover:bg-white/[0.04] active:bg-white/[0.08] cursor-pointer transition-colors"
+                        className="tv-focusable tv-playlist-item relative w-full flex items-center justify-between px-3 py-3 hover:bg-white/[0.04] active:bg-white/[0.08] cursor-pointer transition-colors"
                       >
                         <div className="flex items-center gap-4 min-w-0 flex-1">
                           {/* Material Document / File Icon matching Screenshot 12 */}
@@ -2110,20 +2369,35 @@ export default function App() {
                  Right Area: Independently Scrollable Channel Content for Selected Category */
               <div className="flex-1 flex flex-row min-h-0 overflow-hidden">
                 {/* Left Sidebar: Fixed on screen, independent scroll if categories overflow */}
-                <aside className="w-[220px] sm:w-[270px] md:w-[310px] h-full shrink-0 overflow-y-auto overscroll-contain p-2 space-y-2">
+                <aside className="tv-scroll-container w-[220px] sm:w-[270px] md:w-[310px] h-full shrink-0 overflow-y-auto overscroll-contain p-2 space-y-2">
                   {categoryCounts.map((cat) => {
                     const activeCatName = selectedCategory || categoryCounts[0]?.name;
                     const isSelected = cat.name === activeCatName;
                     return (
                       <div
                         key={cat.name}
+                        tabIndex={0}
+                        role="button"
+                        data-tv="category"
+                        data-active={isSelected ? 'true' : 'false'}
+                        data-category-name={cat.name}
+                        onFocus={(e) => {
+                          focusTvElement(e.currentTarget, true);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === 'Select' || (e as any).keyCode === 23) {
+                            e.preventDefault();
+                            setSelectedCategory(cat.name);
+                            categoryContentRef.current?.scrollTo({ top: 0 });
+                          }
+                        }}
                         onClick={() => {
                           setSelectedCategory(cat.name);
                           categoryContentRef.current?.scrollTo({ top: 0 });
                         }}
-                        className={`rounded-[3px] px-3.5 py-2.5 cursor-pointer transition-colors shadow-[0_1px_2px_rgba(0,0,0,0.3)] ${
+                        className={`tv-focusable tv-category-item rounded-[3px] px-3.5 py-2.5 cursor-pointer transition-colors shadow-[0_1px_2px_rgba(0,0,0,0.3)] ${
                           isSelected
-                            ? 'bg-[#2E8BC0] text-white'
+                            ? 'bg-[#2E8BC0] text-white ring-1 ring-white/30'
                             : 'bg-[#424242] hover:bg-[#4A4A4A] text-white'
                         }`}
                       >
@@ -2145,15 +2419,28 @@ export default function App() {
                 {/* Right Pane: Only this content area scrolls when browsing channels */}
                 <div
                   ref={categoryContentRef}
-                  className="flex-1 h-full overflow-y-auto overscroll-contain px-2 py-2"
+                  className="tv-scroll-container flex-1 h-full overflow-y-auto overscroll-contain px-2 py-2"
                 >
                   {viewLayout === 'grid' ? (
                     <div className="w-full grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-9 gap-x-2 gap-y-4">
                       {filteredChannels.map((ch) => (
                         <div
                           key={ch.id}
+                          tabIndex={0}
+                          role="button"
+                          data-tv="channel"
+                          data-channel-id={ch.id}
+                          onFocus={(e) => {
+                            focusTvElement(e.currentTarget, true);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === 'Select' || (e as any).keyCode === 23) {
+                              e.preventDefault();
+                              handleSelectChannel(ch);
+                            }
+                          }}
                           onClick={() => handleSelectChannel(ch)}
-                          className="flex flex-col items-center justify-start cursor-pointer px-0.5 py-1 rounded hover:bg-white/[0.06] active:bg-white/[0.12] transition-colors"
+                          className="tv-focusable tv-channel-card flex flex-col items-center justify-start cursor-pointer px-1 py-1.5 rounded transition-all"
                         >
                           <ChannelTileLogo channel={ch} />
                           <span className="mt-1.5 text-[11.5px] leading-[1.2] text-[#C8C8C8] text-center line-clamp-2 w-full break-words font-normal">
@@ -2170,8 +2457,21 @@ export default function App() {
                         return (
                           <div
                             key={ch.id}
+                            tabIndex={0}
+                            role="button"
+                            data-tv="channel"
+                            data-channel-id={ch.id}
+                            onFocus={(e) => {
+                              focusTvElement(e.currentTarget, true);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === 'Select' || (e as any).keyCode === 23) {
+                                e.preventDefault();
+                                handleSelectChannel(ch);
+                              }
+                            }}
                             onClick={() => handleSelectChannel(ch)}
-                            className="flex items-center justify-between px-4 py-2.5 hover:bg-white/[0.06] active:bg-white/[0.12] cursor-pointer transition-colors"
+                            className="tv-focusable tv-channel-card flex items-center justify-between px-4 py-2.5 hover:bg-white/[0.06] active:bg-white/[0.12] cursor-pointer transition-colors rounded"
                           >
                             <div className="flex items-center gap-3.5 min-w-0">
                               <ChannelTileLogo channel={ch} />
@@ -2185,6 +2485,7 @@ export default function App() {
                               </div>
                             </div>
                             <button
+                              tabIndex={-1}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 toggleFavorite(ch.id);
@@ -2214,13 +2515,26 @@ export default function App() {
               </div>
             ) : viewLayout === 'grid' ? (
               /* EXACT DENSE BORDERLESS CHANNEL GRID FROM SCREENSHOT 6 */
-              <div className="flex-1 overflow-y-auto w-full px-1.5 py-2.5">
+              <div className="tv-scroll-container flex-1 overflow-y-auto w-full px-1.5 py-2.5">
                 <div className="w-full grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10 xl:grid-cols-12 gap-x-1.5 gap-y-3.5">
                   {filteredChannels.map((ch) => (
                     <div
                       key={ch.id}
+                      tabIndex={0}
+                      role="button"
+                      data-tv="channel"
+                      data-channel-id={ch.id}
+                      onFocus={(e) => {
+                        focusTvElement(e.currentTarget, true);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === 'Select' || (e as any).keyCode === 23) {
+                          e.preventDefault();
+                          handleSelectChannel(ch);
+                        }
+                      }}
                       onClick={() => handleSelectChannel(ch)}
-                      className="flex flex-col items-center justify-start cursor-pointer px-0.5 py-1 rounded hover:bg-white/[0.06] active:bg-white/[0.12] transition-colors"
+                      className="tv-focusable tv-channel-card flex flex-col items-center justify-start cursor-pointer px-1 py-1.5 rounded transition-all"
                     >
                       <ChannelTileLogo channel={ch} />
                       <span className="mt-1 text-[11.5px] leading-[1.2] text-[#C8C8C8] text-center line-clamp-2 w-full break-words font-normal">
@@ -2233,14 +2547,27 @@ export default function App() {
               </div>
             ) : (
               /* Classic List View Option */
-              <div className="flex-1 overflow-y-auto w-full divide-y divide-white/[0.07]">
+              <div className="tv-scroll-container flex-1 overflow-y-auto w-full divide-y divide-white/[0.07]">
                 {filteredChannels.map((ch) => {
                   const isFav = favorites.includes(ch.id);
                   return (
                     <div
                       key={ch.id}
+                      tabIndex={0}
+                      role="button"
+                      data-tv="channel"
+                      data-channel-id={ch.id}
+                      onFocus={(e) => {
+                        focusTvElement(e.currentTarget, true);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === 'Select' || (e as any).keyCode === 23) {
+                          e.preventDefault();
+                          handleSelectChannel(ch);
+                        }
+                      }}
                       onClick={() => handleSelectChannel(ch)}
-                      className="flex items-center justify-between px-4 py-2.5 hover:bg-white/[0.06] active:bg-white/[0.12] cursor-pointer transition-colors"
+                      className="tv-focusable tv-channel-card flex items-center justify-between px-4 py-2.5 hover:bg-white/[0.06] active:bg-white/[0.12] cursor-pointer transition-colors rounded"
                     >
                       <div className="flex items-center gap-3.5 min-w-0">
                         {showChannelNumbers && (
@@ -2258,6 +2585,7 @@ export default function App() {
                       </div>
 
                       <button
+                        tabIndex={-1}
                         onClick={(e) => {
                           e.stopPropagation();
                           toggleFavorite(ch.id);
